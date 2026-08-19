@@ -64,16 +64,7 @@ LogEndpoint::LogEndpoint(std::string name, LogOptions conf)
 {
     assert(!_config.logs_dir.empty());
     _add_sys_comp_id(LOG_ENDPOINT_SYSTEM_ID, 0);
-    _fsync_cb.aio_fildes = -1;
-    _dir_fsync_cb.aio_fildes = -1;
 
-#if HAVE_DECL_AIO_INIT
-    aioinit aio_init_data{};
-    aio_init_data.aio_threads = 1;
-    aio_init_data.aio_num = 1;
-    aio_init_data.aio_idle_time = 3; // make sure to keep the thread running
-    aio_init(&aio_init_data);
-#endif
     if (_config.fcu_id != -1) {
         _target_system_id = _config.fcu_id;
     } else {
@@ -395,7 +386,6 @@ void LogEndpoint::stop()
         close(_file);
     }
     _file = -1;
-    _fsync_cb.aio_fildes = -1;
 
     /* reclaim space now, while nothing is being logged: the just-finished log is counted,
      * and the next start() finds a compliant directory without scanning it on the routing
@@ -410,6 +400,14 @@ bool LogEndpoint::start()
         return false;
     }
 
+    if (!_writer) {
+        // acquired before _get_file(): the directory-entry sync already needs the writer
+        _writer = LogWriter::instance();
+        if (!_writer) {
+            return false; // already reported; no writer means no logging
+        }
+    }
+
     /* The retention scan (statvfs + full directory walk + unlink loop) runs at startup and
      * after stop() — NOT here: start() runs inline in the routing path on the arming
      * heartbeat, where a directory scan on slow storage stalls all routing. Only if opening
@@ -422,13 +420,6 @@ bool LogEndpoint::start()
     if (_file < 0) {
         _file = -1;
         return false;
-    }
-
-    if (!_writer) {
-        _writer = LogWriter::instance();
-        if (!_writer) {
-            goto logging_timeout_error; // already reported; no writer means no logging
-        }
     }
 
     _timeout.logging_start = Mainloop::get_instance().add_timeout(
@@ -478,34 +469,20 @@ void LogEndpoint::_sync_dir_entry(int dir_fd)
 {
     /* A synchronous fsync of the log directory can stall for hundreds of milliseconds on SD
      * storage right after deletions — and _get_file() runs on the routing thread at arm
-     * time. Hand the barrier to the aio helper thread instead (the same machinery as the
-     * 1 Hz data flush). The fd is dup()ed because the caller closes its directory handle. */
-    if (_dir_fsync_cb.aio_fildes >= 0) {
-        if (aio_error(&_dir_fsync_cb) == EINPROGRESS) {
-            // previous sync of the same directory still covers this entry eventually
-            return;
-        }
-        close(_dir_fsync_cb.aio_fildes);
-        _dir_fsync_cb.aio_fildes = -1;
-    }
-
+     * time. Hand the barrier to the background writer: it fsyncs and then closes the
+     * dup()ed fd it takes ownership of (the caller closes its own directory handle).
+     * sync_close() cannot be refused, so the only fallback left is for a failed dup(). */
     int fd_copy = dup(dir_fd);
-    if (fd_copy < 0) {
+    if (fd_copy < 0 || !_writer) {
         if (fsync(dir_fd) == -1) { // synchronous fallback beats losing the barrier
             log_error("fsync failed: %m");
         }
+        if (fd_copy >= 0) {
+            close(fd_copy);
+        }
         return;
     }
-
-    _dir_fsync_cb.aio_fildes = fd_copy;
-    _dir_fsync_cb.aio_sigevent.sigev_notify = SIGEV_NONE;
-    if (aio_fsync(O_SYNC, &_dir_fsync_cb) < 0) {
-        close(fd_copy);
-        _dir_fsync_cb.aio_fildes = -1;
-        if (fsync(dir_fd) == -1) {
-            log_error("fsync failed: %m");
-        }
-    }
+    _writer->sync_close(fd_copy);
 }
 
 ssize_t LogEndpoint::_log_write(const void *buf, size_t len)
@@ -551,24 +528,15 @@ void LogEndpoint::log_aggregate(unsigned int interval_sec)
 
 bool LogEndpoint::_fsync()
 {
-    // reap a finished directory-entry sync (frees its dup()ed fd)
-    if (_dir_fsync_cb.aio_fildes >= 0 && aio_error(&_dir_fsync_cb) != EINPROGRESS) {
-        close(_dir_fsync_cb.aio_fildes);
-        _dir_fsync_cb.aio_fildes = -1;
-    }
-
     if (_file < 0) {
         return false;
     }
 
-    if (_fsync_cb.aio_fildes >= 0 && aio_error(&_fsync_cb) == EINPROGRESS) {
-        // previous operation is still in progress
-        return true;
+    if (_writer) {
+        // takes one of the reserved control slots; only when even those are in use is the
+        // tick skipped, and the next 1 Hz tick retries
+        _writer->fsync(_file);
     }
-    _fsync_cb.aio_fildes = _file;
-    _fsync_cb.aio_sigevent.sigev_notify = SIGEV_NONE;
-
-    aio_fsync(O_SYNC, &_fsync_cb);
 
     return true;
 }
