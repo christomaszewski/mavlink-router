@@ -375,21 +375,31 @@ void LogEndpoint::stop()
         _timeout.fsync = nullptr;
     }
 
-    fsync(_file);
-    close(_file);
-    _file = -1;
-    _fsync_cb.aio_fildes = -1;
-
-    // change file permissions to read-only to mark them as finished
+    /* mark the log finished right away — chmod is a cheap in-memory metadata update, and
+     * the retention scan below only counts read-only files — then hand the file to the
+     * background writer for the expensive part: the final fsync and the close. Disarm no
+     * longer waits on the disk. */
     char log_file[PATH_MAX];
     if (snprintf(log_file, sizeof(log_file), "%s/%s", _config.logs_dir.c_str(), _filename)
         < (int)sizeof(log_file)) {
         chmod(log_file, S_IRUSR | S_IRGRP | S_IROTH);
     }
+    if (_writer) {
+        /* cannot be refused (control records have reserved ring slots), and must not be
+         * replaced by a synchronous close: writes for this fd may still be queued, and
+         * closing it under them would fail them and free the number for the next log —
+         * a stalled worker could then write stale blocks into a different file */
+        _writer->sync_close(_file);
+    } else {
+        fsync(_file);
+        close(_file);
+    }
+    _file = -1;
+    _fsync_cb.aio_fildes = -1;
 
-    /* reclaim space now, while nothing is being logged: the just-finished log is read-only
-     * and counted, and the next start() finds a compliant directory without scanning it on
-     * the routing hot path */
+    /* reclaim space now, while nothing is being logged: the just-finished log is counted,
+     * and the next start() finds a compliant directory without scanning it on the routing
+     * hot path */
     _delete_old_logs();
 }
 
@@ -412,6 +422,13 @@ bool LogEndpoint::start()
     if (_file < 0) {
         _file = -1;
         return false;
+    }
+
+    if (!_writer) {
+        _writer = LogWriter::instance();
+        if (!_writer) {
+            goto logging_timeout_error; // already reported; no writer means no logging
+        }
     }
 
     _timeout.logging_start = Mainloop::get_instance().add_timeout(
@@ -493,20 +510,43 @@ void LogEndpoint::_sync_dir_entry(int dir_fd)
 
 ssize_t LogEndpoint::_log_write(const void *buf, size_t len)
 {
-    ssize_t r = ::write(_file, buf, len);
-    if (r == -1) {
-        return errno == EAGAIN ? -EAGAIN : -errno;
+    /* hand the data to the background writer: the routing thread never touches the disk.
+     * A full queue reports -EAGAIN — callers keep the data (ULog's own buffer) or drop it
+     * (best-effort formats), and BinLog withholds the ack so the flight stack resends. */
+    if (_file < 0) {
+        return -EBADF; // nothing open: never queue a record the worker can only fail
     }
-    return r;
+    if (!_writer) {
+        return -EINVAL;
+    }
+    return _writer->write(_file, buf, len) ? (ssize_t)len : -EAGAIN;
 }
 
 ssize_t LogEndpoint::_log_pwrite(const void *buf, size_t len, off_t offset)
 {
-    ssize_t r = ::pwrite(_file, buf, len, offset);
-    if (r == -1) {
-        return errno == EAGAIN ? -EAGAIN : -errno;
+    if (_file < 0) {
+        return -EBADF;
     }
-    return r;
+    if (!_writer) {
+        return -EINVAL;
+    }
+    return _writer->pwrite(_file, buf, len, offset) ? (ssize_t)len : -EAGAIN;
+}
+
+void LogEndpoint::log_aggregate(unsigned int interval_sec)
+{
+    Endpoint::log_aggregate(interval_sec);
+
+    if (_dropped_records > 0) {
+        log_warning("%s Endpoint [%d]%s: %u log records dropped (writer queue full) in the last "
+                    "%d seconds",
+                    _type.c_str(),
+                    fd,
+                    _name.c_str(),
+                    _dropped_records,
+                    interval_sec);
+        _dropped_records = 0;
+    }
 }
 
 bool LogEndpoint::_fsync()

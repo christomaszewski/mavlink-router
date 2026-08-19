@@ -26,12 +26,18 @@
 #include <endian.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -746,6 +752,109 @@ static int count_logs(const char *dir_path)
     return count;
 }
 
+// path of the log with sequence number idx in dir_path, "" when there is none
+static std::string find_log(const char *dir_path, unsigned idx)
+{
+    std::string found;
+    DIR *dir = opendir(dir_path);
+    if (dir == nullptr) {
+        return found;
+    }
+    struct dirent *ent;
+    uint32_t u;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (sscanf(ent->d_name, "%u-", &u) == 1 && u == idx) {
+            found = std::string(dir_path) + "/" + ent->d_name;
+            break;
+        }
+    }
+    closedir(dir);
+    return found;
+}
+
+// delete a test's temporary log directory and the files in it
+static void remove_dir(const char *dir_path)
+{
+    DIR *dir = opendir(dir_path);
+    if (dir == nullptr) {
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0) {
+            unlinkat(dirfd(dir), ent->d_name, 0);
+        }
+    }
+    closedir(dir);
+    rmdir(dir_path);
+}
+
+static std::vector<uint8_t> read_file(const char *path)
+{
+    std::vector<uint8_t> content;
+    int file = open(path, O_RDONLY);
+    if (file < 0) {
+        return content;
+    }
+    uint8_t chunk[4096];
+    ssize_t n;
+    while ((n = read(file, chunk, sizeof(chunk))) > 0) {
+        content.insert(content.end(), chunk, chunk + n);
+    }
+    close(file);
+    return content;
+}
+
+/*
+ * A pipe nobody reads stands in for stalled storage: the worker blocks writing it and the
+ * ring fills up behind it. The pipe is shrunk to one page so that it absorbs the same
+ * couple of records on every kernel page size.
+ */
+static int make_stall_pipe(int pfd[2])
+{
+    if (pipe(pfd) != 0) {
+        return -1;
+    }
+    fcntl(pfd[1], F_SETPIPE_SZ, 4096);
+    return 0;
+}
+
+// queue full-size records to the pipe until the writer refuses one (or max are queued),
+// then give the worker a moment to block on the full pipe and top the ring up again, so
+// that the data share of the ring is full and stays full; returns how many were accepted
+static uint32_t stall_writer(LogWriter &writer, int pipe_wfd, uint32_t max = UINT32_MAX)
+{
+    uint8_t record[LogWriter::DATA_MAX];
+    uint32_t accepted = 0;
+    for (int round = 0; round < 3 && accepted < max; round++) {
+        while (accepted < max) {
+            memcpy(record, &accepted, sizeof(accepted)); // per-record sequence number
+            if (!writer.write(pipe_wfd, record, sizeof(record))) {
+                break;
+            }
+            accepted++;
+        }
+        usleep(2000);
+    }
+    return accepted;
+}
+
+// consume everything the stalled worker was asked to write, then wait for the ring to empty
+static std::vector<uint8_t> release_writer(LogWriter &writer, int pipe_rfd, size_t bytes)
+{
+    std::vector<uint8_t> got;
+    uint8_t chunk[4096];
+    while (got.size() < bytes) {
+        ssize_t n = read(pipe_rfd, chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        got.insert(got.end(), chunk, chunk + n);
+    }
+    writer.drain();
+    return got;
+}
+
 // start()/stop() talk to the Mainloop timeout machinery
 class LogStartStopTest : public ::testing::Test {
 protected:
@@ -797,33 +906,42 @@ public:
         : TLog{conf}
     {
     }
+    int get_file() const { return _file; }
     void set_file(int file) { _file = file; }
+    void use_writer(std::shared_ptr<LogWriter> writer) { _writer = writer; }
 };
 
-TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
+static LogOptions log_test_options()
 {
     LogOptions conf;
     conf.logs_dir = "./";
     conf.log_mode = LogMode::disabled; // keep write_msg from trying to start a real log
     conf.min_free_space = 0;
     conf.max_log_files = 0;
+    return conf;
+}
 
+TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
+{
     char path[] = "/tmp/tlog_test_XXXXXX";
     int file = mkstemp(path);
     ASSERT_GE(file, 0);
 
-    TestTLog tlog{conf};
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    TestTLog tlog{log_test_options()};
     tlog.set_file(file);
+    tlog.use_writer(writer);
 
     uint8_t payload[64];
     memset(payload, 0x6C, sizeof(payload));
-    struct buffer msg {
-    };
+    struct buffer msg = {};
     msg.data = payload;
     msg.len = sizeof(payload);
     msg.curr.msg_id = 1; // not a heartbeat
 
     EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+    writer->drain(); // the record is written by the background writer
 
     // one record: 8-byte big-endian microsecond timestamp, then the payload verbatim
     uint8_t content[128];
@@ -838,6 +956,313 @@ TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
 
     close(file);
     unlink(path);
+}
+
+TEST(LogEndpointTest, TlogIgnoresMessagesWhileNotLogging)
+{
+    // The endpoint accepts every routed message, but must queue nothing while no log is
+    // open: the worker could only fail such records, and they would take ring slots from
+    // a log that is open.
+    uint8_t payload[64] = {};
+    struct buffer msg = {};
+    msg.data = payload;
+    msg.len = sizeof(payload);
+    msg.curr.msg_id = 1;
+
+    // before the first start() there is not even a writer
+    TestTLog tlog{log_test_options()};
+    EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+
+    // with a writer but no file: fill the data slots first, so that any record the
+    // endpoint tried to queue would show up as a refused one
+    int pfd[2];
+    ASSERT_EQ(make_stall_pipe(pfd), 0);
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    tlog.use_writer(writer);
+    const uint32_t stalled = stall_writer(*writer, pfd[1]);
+    const uint32_t dropped_before = writer->dropped();
+
+    for (int i = 0; i < 10; i++) {
+        EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+    }
+    EXPECT_EQ(writer->dropped(), dropped_before);
+
+    release_writer(*writer, pfd[0], stalled * LogWriter::DATA_MAX);
+    close(pfd[0]);
+    close(pfd[1]);
+}
+
+TEST_F(LogStartStopTest, TlogStopStartHandsOffFd)
+{
+    // stop() hands the file to the writer, and the writer may still hold writes for it
+    // when start() opens the next log. The old fd must stay open until those are done --
+    // if it were closed early, its number could be reused for the new log and stale
+    // records would land in the wrong file.
+    char dir_tmpl[] = "/tmp/loghandoff_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    ASSERT_NE(dir, nullptr);
+
+    LogOptions conf;
+    conf.logs_dir = dir;
+    conf.log_mode = LogMode::always;
+    conf.min_free_space = 0;
+    conf.max_log_files = 0;
+
+    int pfd[2];
+    ASSERT_EQ(make_stall_pipe(pfd), 0);
+
+    uint8_t payload[16];
+    struct buffer msg = {};
+    msg.data = payload;
+    msg.len = sizeof(payload);
+    msg.curr.msg_id = 1;
+
+    {
+        TestTLog tlog{conf};
+        ASSERT_TRUE(tlog.start());
+        auto writer = LogWriter::instance(); // the endpoint's own instance
+        ASSERT_NE(writer, nullptr);
+        const int old_fd = tlog.get_file();
+
+        memset(payload, 0xAA, sizeof(payload));
+        EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+        writer->drain();
+
+        // stall the worker so the close queued by stop() is still pending across start()
+        const uint32_t stalled = stall_writer(*writer, pfd[1], 4);
+        tlog.stop();
+        ASSERT_TRUE(tlog.start());
+        const int new_fd = tlog.get_file();
+        EXPECT_NE(new_fd, old_fd); // the old fd is still open, so its number is not reused
+        memset(payload, 0xBB, sizeof(payload));
+        EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+
+        release_writer(*writer, pfd[0], stalled * LogWriter::DATA_MAX);
+
+        // only now is the old fd closed; each file holds exactly its own record
+        EXPECT_EQ(fcntl(old_fd, F_GETFD), -1);
+        EXPECT_NE(fcntl(new_fd, F_GETFD), -1);
+        std::vector<uint8_t> old_log = read_file(find_log(dir, 0).c_str());
+        std::vector<uint8_t> new_log = read_file(find_log(dir, 1).c_str());
+        ASSERT_EQ(old_log.size(), sizeof(uint64_t) + sizeof(payload));
+        ASSERT_EQ(new_log.size(), sizeof(uint64_t) + sizeof(payload));
+        EXPECT_TRUE(
+            std::all_of(old_log.begin() + 8, old_log.end(), [](uint8_t b) { return b == 0xAA; }));
+        EXPECT_TRUE(
+            std::all_of(new_log.begin() + 8, new_log.end(), [](uint8_t b) { return b == 0xBB; }));
+
+        tlog.stop();
+        writer->drain();
+    }
+
+    close(pfd[0]);
+    close(pfd[1]);
+    remove_dir(dir);
+}
+
+/**
+ * LogWriter (background log IO)
+ */
+
+TEST(LogWriterTest, FifoByteExactAcrossFiles)
+{
+    char path_a[] = "/tmp/logwriter_a_XXXXXX";
+    char path_b[] = "/tmp/logwriter_b_XXXXXX";
+    int fd_a = mkstemp(path_a);
+    int fd_b = mkstemp(path_b);
+    ASSERT_GE(fd_a, 0);
+    ASSERT_GE(fd_b, 0);
+
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    uint8_t block[100];
+
+    memset(block, 0xA1, sizeof(block));
+    EXPECT_TRUE(writer->write(fd_a, block, sizeof(block)));
+    memset(block, 0xB1, sizeof(block));
+    EXPECT_TRUE(writer->write(fd_b, block, sizeof(block)));
+    memset(block, 0xA2, sizeof(block));
+    EXPECT_TRUE(writer->write(fd_a, block, sizeof(block)));
+    memset(block, 0xB2, sizeof(block));
+    EXPECT_TRUE(writer->pwrite(fd_b, block, sizeof(block), 100));
+    writer->drain();
+
+    uint8_t content[256];
+    ASSERT_EQ(pread(fd_a, content, sizeof(content), 0), 200);
+    EXPECT_TRUE(std::all_of(content, content + 100, [](uint8_t b) { return b == 0xA1; }));
+    EXPECT_TRUE(std::all_of(content + 100, content + 200, [](uint8_t b) { return b == 0xA2; }));
+    ASSERT_EQ(pread(fd_b, content, sizeof(content), 0), 200);
+    EXPECT_TRUE(std::all_of(content, content + 100, [](uint8_t b) { return b == 0xB1; }));
+    EXPECT_TRUE(std::all_of(content + 100, content + 200, [](uint8_t b) { return b == 0xB2; }));
+
+    close(fd_a);
+    close(fd_b);
+    unlink(path_a);
+    unlink(path_b);
+}
+
+TEST(LogWriterTest, SyncCloseClosesFdAfterQueuedWrites)
+{
+    char path[] = "/tmp/logwriter_c_XXXXXX";
+    int file = mkstemp(path);
+    ASSERT_GE(file, 0);
+
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    uint8_t block[64];
+    memset(block, 0xC3, sizeof(block));
+    EXPECT_TRUE(writer->write(file, block, sizeof(block)));
+    writer->sync_close(file); // worker owns the fd from here
+    writer->drain();
+
+    struct stat st;
+    ASSERT_EQ(stat(path, &st), 0);
+    EXPECT_EQ(st.st_size, 64); // the write queued before the close made it
+    EXPECT_EQ(fcntl(file, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+    unlink(path);
+}
+
+TEST(LogWriterTest, FullQueueDropsButNeverBlocks)
+{
+    // With the worker stalled on the pipe, further enqueues must return false immediately
+    // instead of blocking, and every accepted record must still arrive whole and in order.
+    int pfd[2];
+    ASSERT_EQ(make_stall_pipe(pfd), 0);
+
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    constexpr size_t RECLEN = LogWriter::DATA_MAX;
+    constexpr uint32_t TOTAL = 200; // > ring capacity + what the pipe buffer absorbs
+    uint8_t record[RECLEN];
+
+    const uint32_t dropped_before = writer->dropped(); // shared writer: not necessarily 0
+    uint32_t accepted = 0;
+    for (uint32_t i = 0; i < TOTAL; i++) {
+        memcpy(record, &i, sizeof(i)); // per-record sequence number for the FIFO check
+        if (writer->write(pfd[1], record, RECLEN)) {
+            accepted++;
+        }
+    }
+    const uint32_t dropped = writer->dropped() - dropped_before;
+    EXPECT_GT(dropped, 0u);
+    EXPECT_EQ(accepted + dropped, TOTAL);
+
+    std::vector<uint8_t> got = release_writer(*writer, pfd[0], accepted * RECLEN);
+    ASSERT_EQ(got.size(), accepted * RECLEN);
+
+    // accepted records arrive whole and in order (sequence numbers strictly increasing)
+    uint32_t prev = 0;
+    bool first = true;
+    for (size_t off = 0; off < got.size(); off += RECLEN) {
+        uint32_t seq;
+        memcpy(&seq, got.data() + off, sizeof(seq));
+        if (!first) {
+            ASSERT_GT(seq, prev);
+        }
+        prev = seq;
+        first = false;
+    }
+
+    close(pfd[0]);
+    close(pfd[1]);
+}
+
+TEST(LogWriterTest, SyncCloseSurvivesFullRing)
+{
+    int pfd[2];
+    ASSERT_EQ(make_stall_pipe(pfd), 0);
+    char path[] = "/tmp/logwriter_d_XXXXXX";
+    int file = mkstemp(path);
+    ASSERT_GE(file, 0);
+
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    uint8_t block[LogWriter::DATA_MAX];
+    memset(block, 0xD4, sizeof(block));
+    EXPECT_TRUE(writer->write(file, block, 64));
+    writer->drain();
+
+    // stall the worker and fill the data share of the ring: data is refused from now on...
+    const uint32_t dropped_before = writer->dropped();
+    const uint32_t stalled = stall_writer(*writer, pfd[1]);
+    EXPECT_GT(writer->dropped(), dropped_before);
+    // ...but control records still find room in the reserve, until even that is taken and
+    // a periodic fsync is skipped...
+    uint32_t fsyncs = 0;
+    while (writer->fsync(file)) {
+        fsyncs++;
+    }
+    EXPECT_GE(fsyncs, (uint32_t)LogWriter::CONTROL_RESERVE);
+    // ...while a close is not: it waits until the worker's current write returns and
+    // frees a slot
+    std::thread reader([&] { release_writer(*writer, pfd[0], stalled * LogWriter::DATA_MAX); });
+    writer->sync_close(file);
+    reader.join();
+
+    // exactly the accepted bytes reached the file, which the worker then closed
+    struct stat st;
+    ASSERT_EQ(stat(path, &st), 0);
+    EXPECT_EQ(st.st_size, 64);
+    EXPECT_EQ(fcntl(file, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
+
+    close(pfd[0]);
+    close(pfd[1]);
+    unlink(path);
+}
+
+TEST(LogWriterTest, WorkerBlocksAllSignals)
+{
+    // mavlink-routerd's SIGTERM/SIGINT handlers only set a flag that the routing thread
+    // notices when its epoll_wait returns: a signal delivered to the worker instead would
+    // not interrupt that wait, so the worker must not be a candidate for delivery.
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+
+    DIR *tasks = opendir("/proc/self/task");
+    ASSERT_NE(tasks, nullptr);
+    bool found = false;
+    unsigned long long blocked = 0;
+    struct dirent *ent;
+    while ((ent = readdir(tasks)) != nullptr) {
+        char path[PATH_MAX];
+        char line[256] = {};
+        snprintf(path, sizeof(path), "/proc/self/task/%s/comm", ent->d_name);
+        FILE *comm = fopen(path, "r");
+        if (comm == nullptr) {
+            continue;
+        }
+        const bool is_worker
+            = fgets(line, sizeof(line), comm) != nullptr && strncmp(line, "log-writer", 10) == 0;
+        fclose(comm);
+        if (!is_worker) {
+            continue;
+        }
+        snprintf(path, sizeof(path), "/proc/self/task/%s/status", ent->d_name);
+        FILE *status = fopen(path, "r");
+        ASSERT_NE(status, nullptr);
+        while (fgets(line, sizeof(line), status) != nullptr) {
+            if (sscanf(line, "SigBlk: %llx", &blocked) == 1) {
+                found = true;
+                break;
+            }
+        }
+        fclose(status);
+        break;
+    }
+    closedir(tasks);
+
+    ASSERT_TRUE(found) << "no thread named log-writer";
+    EXPECT_NE(blocked & (1ULL << (SIGTERM - 1)), 0u);
+    EXPECT_NE(blocked & (1ULL << (SIGINT - 1)), 0u);
+
+    // the creating thread's own mask is restored: signals still reach the daemon's handlers
+    sigset_t mine;
+    ASSERT_EQ(pthread_sigmask(SIG_BLOCK, nullptr, &mine), 0);
+    EXPECT_FALSE(sigismember(&mine, SIGTERM));
+    EXPECT_FALSE(sigismember(&mine, SIGINT));
 }
 
 TEST(LogEndpointTest, Init)

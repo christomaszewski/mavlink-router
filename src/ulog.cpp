@@ -91,11 +91,15 @@ void ULog::stop()
     _send_msg(&msg, _target_system_id);
 
     _buffer_len = 0;
-    /* Write the last partial message to avoid corrupt the end of the file */
-    while (_buffer_partial_len) {
-        if (!_logging_flush()) {
-            break;
-        }
+    /* Write the last partial message to avoid corrupt the end of the file. The writer takes
+     * a record whole or refuses it, so one attempt is all there is: retrying until the ring
+     * has room would spin the routing thread on the disk. */
+    _logging_flush();
+    if (_buffer_partial_len) {
+        log_warning("ULog: %u bytes of a partial message lost at stop (writer queue full)",
+                    _buffer_partial_len);
+        _dropped_records++;
+        _buffer_partial_len = 0;
     }
 
     LogEndpoint::stop();
@@ -177,6 +181,9 @@ int ULog::write_msg(const struct buffer *buffer)
     }
         /* fall through */
     case MAVLINK_MSG_ID_LOGGING_DATA: {
+        if (_file < 0) {
+            break; // not logging: nothing to append the data to
+        }
         if (trimmed_zeros) {
             mavlink_logging_data_t ulog_data;
             memcpy(&ulog_data, buffer->curr.payload, payload_len);
@@ -275,6 +282,7 @@ void ULog::_logging_data_process(mavlink_logging_data_t *msg)
      */
     if ((_buffer_len + msg->length) > BUFFER_LEN) {
         log_warning("Buffer full, dropping everything on buffer");
+        _dropped_records++;
 
         _buffer_len = 0;
         _waiting_first_msg_offset = true;

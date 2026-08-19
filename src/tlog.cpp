@@ -66,6 +66,10 @@ int TLog::write_msg(const struct buffer *buffer)
     /* Check if we should start or stop logging */
     _handle_auto_start_stop(buffer);
 
+    if (_file < 0) {
+        return buffer->len; // not logging: never started, disarmed, or just stopped above
+    }
+
     uint64_t ms_since_epoch = std::chrono::duration_cast<std::chrono::microseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
@@ -82,7 +86,9 @@ int TLog::write_msg(const struct buffer *buffer)
     memcpy(record + sizeof(uint64_t), buffer->data, buffer->len);
 
     ssize_t r = _log_write(record, sizeof(uint64_t) + buffer->len);
-    if (r < 0 && r != -EAGAIN) {
+    if (r == -EAGAIN) {
+        _dropped_records++; // reported by log_aggregate(): a lost frame must not be silent
+    } else if (r < 0) {
         log_error("TLog [%d]%s: Error writing to log file (%s)",
                   fd,
                   _name.c_str(),

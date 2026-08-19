@@ -164,7 +164,7 @@ public:
     virtual int write_msg(const struct buffer *pbuf) = 0;
     virtual int flush_pending_msgs() = 0;
 
-    void log_aggregate(unsigned int interval_sec);
+    virtual void log_aggregate(unsigned int interval_sec);
 
     static uint8_t get_trimmed_zeros(const mavlink_msg_entry_t *msg_entry,
                                      const struct buffer *buffer);
