@@ -125,10 +125,14 @@ if __name__ == "__main__":
                         help="path to mavlink-routerd")
     args = parser.parse_args()
 
-    # Setup mavlink-router
+    # Setup mavlink-router. The TCP client endpoint points at an unroutable TEST-NET-1
+    # address (RFC 5737): it can never connect, so the router keeps retrying it for the
+    # whole test. The exact-count assertions below then double as a regression test that
+    # a dead TCP peer cannot stall UDP routing (connect attempts used to run blocking
+    # inside the event loop).
     with subprocess.Popen([
             args.binary, "-e", "127.0.0.1:10100", "-e", "127.0.0.1:10101",
-            "127.0.0.1:10000", "-c", "/nonexistent"
+            "127.0.0.1:10000", "-c", "/nonexistent", "-p", "192.0.2.1:5790"
     ],
                           stderr=sys.stdout.fileno(),
                           stdout=sys.stdout.fileno()) as proc:
