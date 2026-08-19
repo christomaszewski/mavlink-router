@@ -22,15 +22,20 @@
 #include "tlog.h"
 #include "ulog.h"
 
+#include <dirent.h>
 #include <endian.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 
 #include <gtest/gtest.h>
+
+#include "mainloop.h"
 
 /**
  * Endpoint base class
@@ -723,6 +728,69 @@ TEST(TcpEndpointTest, ConfigValidatePort)
 /**
  * Log Endpoint
  */
+static int count_logs(const char *dir_path)
+{
+    DIR *dir = opendir(dir_path);
+    if (dir == nullptr) {
+        return -1;
+    }
+    int count = 0;
+    struct dirent *ent;
+    uint32_t u;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (sscanf(ent->d_name, "%u-", &u) == 1) {
+            count++;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+// start()/stop() talk to the Mainloop timeout machinery
+class LogStartStopTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        Mainloop &mainloop = Mainloop::init();
+        // returns -EBUSY when a previous test left the epoll fd open -- that instance works fine
+        mainloop.open();
+    }
+    void TearDown() override { Mainloop::teardown(); }
+};
+
+TEST_F(LogStartStopTest, RetentionRunsAfterStopNotAtStart)
+{
+    char dir_tmpl[] = "/tmp/logretention_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    ASSERT_NE(dir, nullptr);
+
+    // two finished (read-only) logs from previous flights
+    for (const char *name : {"00001-2026-01-01_00-00-00.tlog", "00002-2026-01-02_00-00-00.tlog"}) {
+        char path[PATH_MAX];
+        ASSERT_LT(snprintf(path, sizeof(path), "%s/%s", dir, name), (int)sizeof(path));
+        int file = open(path, O_WRONLY | O_CREAT, 0644);
+        ASSERT_GE(file, 0);
+        ASSERT_EQ(write(file, "x", 1), 1);
+        close(file);
+        chmod(path, S_IRUSR | S_IRGRP | S_IROTH);
+    }
+
+    LogOptions conf;
+    conf.logs_dir = dir;
+    conf.log_mode = LogMode::always;
+    conf.min_free_space = 0;
+    conf.max_log_files = 1;
+
+    TLog tlog{conf};
+    ASSERT_TRUE(tlog.start());
+    // start() must not have scanned or deleted anything: both old logs plus the new one exist
+    EXPECT_EQ(count_logs(dir), 3);
+
+    tlog.stop();
+    // stop() reclaims: only the newest (the just-finished log) survives MaxLogFiles=1
+    EXPECT_EQ(count_logs(dir), 1);
+}
+
 class TestTLog : public TLog {
 public:
     TestTLog(const LogOptions &conf)

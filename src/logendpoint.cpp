@@ -136,6 +136,10 @@ void LogEndpoint::mark_unfinished_logs()
         }
     }
     closedir(dir);
+
+    /* startup (crash logs now marked finished) is also the right moment for the retention
+     * scan — see the note in start() */
+    _delete_old_logs();
 }
 
 void LogEndpoint::_delete_old_logs()
@@ -383,6 +387,11 @@ void LogEndpoint::stop()
         < (int)sizeof(log_file)) {
         chmod(log_file, S_IRUSR | S_IRGRP | S_IROTH);
     }
+
+    /* reclaim space now, while nothing is being logged: the just-finished log is read-only
+     * and counted, and the next start() finds a compliant directory without scanning it on
+     * the routing hot path */
+    _delete_old_logs();
 }
 
 bool LogEndpoint::start()
@@ -392,10 +401,15 @@ bool LogEndpoint::start()
         return false;
     }
 
-    // Clear up space before opening a new file
-    _delete_old_logs();
-
+    /* The retention scan (statvfs + full directory walk + unlink loop) runs at startup and
+     * after stop() — NOT here: start() runs inline in the routing path on the arming
+     * heartbeat, where a directory scan on slow storage stalls all routing. Only if opening
+     * still fails (e.g. out of space since the last scan) make room once and retry. */
     _file = _get_file(_get_logfile_extension());
+    if (_file < 0) {
+        _delete_old_logs();
+        _file = _get_file(_get_logfile_extension());
+    }
     if (_file < 0) {
         _file = -1;
         return false;
