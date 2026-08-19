@@ -380,6 +380,7 @@ protected:
     int open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode);
 
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
+    ssize_t _write_raw(const uint8_t *data, size_t len) override;
 
     union {
         struct sockaddr_in v4;
