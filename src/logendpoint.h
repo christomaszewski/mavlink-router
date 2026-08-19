@@ -19,12 +19,14 @@
 
 #include <common/conf_file.h>
 
-#include <aio.h>
 #include <assert.h>
 #include <dirent.h>
+
+#include <memory>
 #include <string>
 
 #include "endpoint.h"
+#include "logwriter.h"
 #include "timeout.h"
 
 #define LOG_ENDPOINT_SYSTEM_ID 2
@@ -79,7 +81,7 @@ protected:
         Timeout *alive = nullptr;
     } _timeout;
     uint32_t _timeout_write_total = 0;
-    aiocb _fsync_cb = {};
+    std::shared_ptr<LogWriter> _writer; ///< background writer, shared by all log endpoints
 
     virtual const char *_get_logfile_extension() = 0;
 
@@ -91,6 +93,14 @@ protected:
     virtual bool _alive_timeout();
 
     bool _fsync();
+    void _sync_dir_entry(int dir_fd);
+
+    /// Write log data at the current file offset. Returns len on success, -EAGAIN when the
+    /// data cannot be accepted right now (callers keep or drop it — log data is best-effort),
+    /// a shorter count on a short write, or a negative errno.
+    ssize_t _log_write(const void *buf, size_t len);
+    /// Positioned variant (BinLog's random-access blocks); does not move the file offset.
+    ssize_t _log_pwrite(const void *buf, size_t len, off_t offset);
 
     void _handle_auto_start_stop(const struct buffer *pbuf);
 

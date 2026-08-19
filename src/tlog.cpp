@@ -20,6 +20,7 @@
 #include <assert.h>
 #include <endian.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -71,7 +72,22 @@ int TLog::write_msg(const struct buffer *buffer)
 
     ms_since_epoch = htobe64(ms_since_epoch);
 
-    write(_file, (void *)&ms_since_epoch, sizeof(uint64_t));
-    write(_file, buffer->data, buffer->len);
-    return buffer->len;
+    if (buffer->len > MAVLINK_MAX_PACKET_LEN) {
+        return buffer->len; // corrupt length; never overrun the record buffer
+    }
+
+    /* one self-contained record per message: timestamp + frame */
+    uint8_t record[sizeof(uint64_t) + MAVLINK_MAX_PACKET_LEN];
+    memcpy(record, &ms_since_epoch, sizeof(uint64_t));
+    memcpy(record + sizeof(uint64_t), buffer->data, buffer->len);
+
+    ssize_t r = _log_write(record, sizeof(uint64_t) + buffer->len);
+    if (r < 0 && r != -EAGAIN) {
+        log_error("TLog [%d]%s: Error writing to log file (%s)",
+                  fd,
+                  _name.c_str(),
+                  strerror((int)-r));
+    }
+
+    return buffer->len; // logging is best-effort: never fail the router over log IO
 }

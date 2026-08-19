@@ -64,15 +64,7 @@ LogEndpoint::LogEndpoint(std::string name, LogOptions conf)
 {
     assert(!_config.logs_dir.empty());
     _add_sys_comp_id(LOG_ENDPOINT_SYSTEM_ID, 0);
-    _fsync_cb.aio_fildes = -1;
 
-#if HAVE_DECL_AIO_INIT
-    aioinit aio_init_data{};
-    aio_init_data.aio_threads = 1;
-    aio_init_data.aio_num = 1;
-    aio_init_data.aio_idle_time = 3; // make sure to keep the thread running
-    aio_init(&aio_init_data);
-#endif
     if (_config.fcu_id != -1) {
         _target_system_id = _config.fcu_id;
     } else {
@@ -136,6 +128,10 @@ void LogEndpoint::mark_unfinished_logs()
         }
     }
     closedir(dir);
+
+    /* startup (crash logs now marked finished) is also the right moment for the retention
+     * scan — see the note in start() */
+    _delete_old_logs();
 }
 
 void LogEndpoint::_delete_old_logs()
@@ -342,10 +338,8 @@ int LogEndpoint::_get_file(const char *extension)
             continue;
         }
 
-        // Ensure the directory entry of the file is written to disk
-        if (fsync(dir_fd) == -1) {
-            log_error("fsync failed: %m");
-        }
+        // Ensure the directory entry of the file gets written to disk
+        _sync_dir_entry(dir_fd);
 
         return r;
     }
@@ -372,17 +366,26 @@ void LogEndpoint::stop()
         _timeout.fsync = nullptr;
     }
 
-    fsync(_file);
-    close(_file);
-    _file = -1;
-    _fsync_cb.aio_fildes = -1;
-
-    // change file permissions to read-only to mark them as finished
+    /* mark the log finished right away — chmod is a cheap in-memory metadata update, and
+     * the retention scan below only counts read-only files — then hand the file to the
+     * background writer for the expensive part: the final fsync and the close. Disarm no
+     * longer waits on the disk. */
     char log_file[PATH_MAX];
     if (snprintf(log_file, sizeof(log_file), "%s/%s", _config.logs_dir.c_str(), _filename)
         < (int)sizeof(log_file)) {
         chmod(log_file, S_IRUSR | S_IRGRP | S_IROTH);
     }
+    if (!_writer || !_writer->sync_close(_file, nullptr)) {
+        // no writer or full ring: synchronous fallback beats leaking the fd
+        fsync(_file);
+        close(_file);
+    }
+    _file = -1;
+
+    /* reclaim space now, while nothing is being logged: the just-finished log is counted,
+     * and the next start() finds a compliant directory without scanning it on the routing
+     * hot path */
+    _delete_old_logs();
 }
 
 bool LogEndpoint::start()
@@ -392,10 +395,20 @@ bool LogEndpoint::start()
         return false;
     }
 
-    // Clear up space before opening a new file
-    _delete_old_logs();
+    if (!_writer) {
+        // acquired before _get_file(): the directory-entry sync already needs the writer
+        _writer = LogWriter::instance();
+    }
 
+    /* The retention scan (statvfs + full directory walk + unlink loop) runs at startup and
+     * after stop() — NOT here: start() runs inline in the routing path on the arming
+     * heartbeat, where a directory scan on slow storage stalls all routing. Only if opening
+     * still fails (e.g. out of space since the last scan) make room once and retry. */
     _file = _get_file(_get_logfile_extension());
+    if (_file < 0) {
+        _delete_old_logs();
+        _file = _get_file(_get_logfile_extension());
+    }
     if (_file < 0) {
         _file = -1;
         return false;
@@ -444,20 +457,52 @@ bool LogEndpoint::_alive_timeout()
     return true;
 }
 
+void LogEndpoint::_sync_dir_entry(int dir_fd)
+{
+    /* A synchronous fsync of the log directory can stall for hundreds of milliseconds on SD
+     * storage right after deletions — and _get_file() runs on the routing thread at arm
+     * time. Hand the barrier to the background writer: it fsyncs and then closes the
+     * dup()ed fd it takes ownership of (the caller closes its own directory handle). */
+    int fd_copy = dup(dir_fd);
+    if (fd_copy < 0 || !_writer || !_writer->sync_close(fd_copy, nullptr)) {
+        if (fd_copy >= 0) {
+            close(fd_copy);
+        }
+        if (fsync(dir_fd) == -1) { // synchronous fallback beats losing the barrier
+            log_error("fsync failed: %m");
+        }
+    }
+}
+
+ssize_t LogEndpoint::_log_write(const void *buf, size_t len)
+{
+    /* hand the data to the background writer: the routing thread never touches the disk.
+     * A full queue reports -EAGAIN — callers keep the data (ULog's own buffer) or drop it
+     * (best-effort formats), and BinLog withholds the ack so the flight stack resends. */
+    if (!_writer) {
+        return -EINVAL;
+    }
+    return _writer->write(_file, buf, len) ? (ssize_t)len : -EAGAIN;
+}
+
+ssize_t LogEndpoint::_log_pwrite(const void *buf, size_t len, off_t offset)
+{
+    if (!_writer) {
+        return -EINVAL;
+    }
+    return _writer->pwrite(_file, buf, len, offset) ? (ssize_t)len : -EAGAIN;
+}
+
 bool LogEndpoint::_fsync()
 {
     if (_file < 0) {
         return false;
     }
 
-    if (_fsync_cb.aio_fildes >= 0 && aio_error(&_fsync_cb) == EINPROGRESS) {
-        // previous operation is still in progress
-        return true;
+    if (_writer) {
+        // a full ring just skips this tick; the next 1 Hz tick retries
+        _writer->fsync(_file);
     }
-    _fsync_cb.aio_fildes = _file;
-    _fsync_cb.aio_sigevent.sigev_notify = SIGEV_NONE;
-
-    aio_fsync(O_SYNC, &_fsync_cb);
 
     return true;
 }

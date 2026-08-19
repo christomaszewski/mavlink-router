@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -313,12 +314,12 @@ void ULog::_logging_data_process(mavlink_logging_data_t *msg)
 bool ULog::_logging_flush()
 {
     while (_buffer_partial_len) {
-        const ssize_t r = write(_file, _buffer_partial, _buffer_partial_len);
-        if (r == 0 || (r == -1 && errno == EAGAIN)) {
+        const ssize_t r = _log_write(_buffer_partial, _buffer_partial_len);
+        if (r == 0 || r == -EAGAIN) {
             return true;
         }
         if (r < 0) {
-            log_error("Unable to write to ULog file: (%m)");
+            log_error("Unable to write to ULog file: (%s)", strerror((int)-r));
             return false;
         }
 
@@ -334,17 +335,17 @@ bool ULog::_logging_flush()
             break;
         }
 
-        const ssize_t r = write(_file, header, full_msg_size);
+        const ssize_t r = _log_write(header, full_msg_size);
         if (r == full_msg_size) {
             _buffer_len -= full_msg_size;
             _buffer_index += full_msg_size;
             continue;
         }
-        if (r == 0 || (r == -1 && errno == EAGAIN)) {
+        if (r == 0 || r == -EAGAIN) {
             break;
         }
         if (r < 0) {
-            log_error("Unable to write to ULog file: (%m)");
+            log_error("Unable to write to ULog file: (%s)", strerror((int)-r));
             return false;
         }
 
