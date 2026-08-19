@@ -19,10 +19,18 @@
 #include "autolog.h"
 #include "binlog.h"
 #include "endpoint.h"
+#include "mainloop.h"
 #include "tlog.h"
 #include "ulog.h"
 
+#include <errno.h>
 #include <limits.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
 
 #include <gtest/gtest.h>
 
@@ -712,6 +720,178 @@ TEST(TcpEndpointTest, ConfigValidatePort)
     config.port = 0;
     EXPECT_FALSE(TcpEndpoint::validate_config(config))
         << "with port " << std::to_string(config.port);
+}
+
+class TestTcpEndpoint : public TcpEndpoint {
+public:
+    TestTcpEndpoint()
+        : TcpEndpoint{"tcp-test"}
+    {
+    }
+    using TcpEndpoint::open;
+    bool connecting() const { return _connecting; }
+};
+
+// TCP client connect tests need a Mainloop instance: open() registers the fd with epoll, and a
+// failed connect completion unregisters it again.
+class TcpConnectTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        Mainloop &mainloop = Mainloop::init();
+        // returns -EBUSY when a previous test left the epoll fd open -- that instance works fine
+        mainloop.open();
+    }
+    void TearDown() override { Mainloop::teardown(); }
+
+    // socket bound to an ephemeral loopback port, not listening; port returned by reference
+    static int bind_loopback(unsigned long &port)
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return -1;
+        }
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t addrlen = sizeof(addr);
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0
+            || getsockname(fd, (struct sockaddr *)&addr, &addrlen) < 0) {
+            close(fd);
+            return -1;
+        }
+        port = ntohs(addr.sin_port);
+        return fd;
+    }
+
+    static int open_listener(unsigned long &port, int backlog = 1)
+    {
+        int fd = bind_loopback(port);
+        if (fd >= 0 && listen(fd, backlog) < 0) {
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
+    // Listener a connect to which never completes: listen(fd, 0) admits a single established
+    // connection (the helper, which is never accepted) and with its accept queue full the
+    // kernel drops further SYNs without answering (Linux defaults to
+    // net.ipv4.tcp_abort_on_overflow=0), so a client keeps retransmitting the SYN and its
+    // connect stays pending for as long as the listener and the helper are kept open.
+    static int open_stalled_listener(unsigned long &port, int &helper)
+    {
+        int fd = open_listener(port, 0);
+        if (fd < 0) {
+            return -1;
+        }
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(port);
+        helper = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        if (helper < 0) {
+            close(fd);
+            return -1;
+        }
+        // the listener becomes readable once the helper's connection sits in its accept queue
+        int r = connect(helper, (struct sockaddr *)&addr, sizeof(addr));
+        if ((r < 0 && errno != EINPROGRESS) || !wait_for(fd, POLLIN, 2000)) {
+            close(helper);
+            close(fd);
+            return -1;
+        }
+        return fd;
+    }
+
+    static bool wait_for(int fd, short events, int timeout_ms)
+    {
+        struct pollfd pfd = {};
+        pfd.fd = fd;
+        pfd.events = events;
+        return poll(&pfd, 1, timeout_ms) == 1;
+    }
+
+    static bool wait_writable(int fd, int timeout_ms) { return wait_for(fd, POLLOUT, timeout_ms); }
+};
+
+TEST_F(TcpConnectTest, AsyncConnectSuccess)
+{
+    unsigned long port = 0;
+    int listener = open_listener(port);
+    ASSERT_GE(listener, 0);
+
+    TestTcpEndpoint tcp{};
+    ASSERT_TRUE(tcp.open("127.0.0.1", port));
+    // a non-blocking connect is reported as in progress even on loopback (EINPROGRESS)
+    ASSERT_TRUE(tcp.connecting());
+    ASSERT_TRUE(wait_writable(tcp.fd, 2000));
+    EXPECT_FALSE(tcp.handle_canwrite()); // false: mainloop switches EPOLLOUT -> EPOLLIN
+    EXPECT_FALSE(tcp.connecting());
+    EXPECT_GE(tcp.fd, 0);
+    EXPECT_TRUE(tcp.is_valid());
+
+    close(listener);
+}
+
+TEST_F(TcpConnectTest, AsyncConnectRefused)
+{
+    // bound but not listening: the kernel answers the SYN with a RST (ECONNREFUSED), and holding
+    // the port for the whole test keeps another process from listening on it in the meantime
+    unsigned long port = 0;
+    int bound = bind_loopback(port);
+    ASSERT_GE(bound, 0);
+
+    TestTcpEndpoint tcp{};
+    ASSERT_TRUE(tcp.open("127.0.0.1", port));
+    ASSERT_TRUE(tcp.connecting());
+    ASSERT_TRUE(wait_writable(tcp.fd, 2000));
+    EXPECT_TRUE(tcp.handle_canwrite()); // true: fd already closed, no mod_fd wanted
+    EXPECT_EQ(tcp.fd, -1);
+    EXPECT_FALSE(tcp.connecting());
+    EXPECT_TRUE(tcp.is_valid()); // a refused connect must not get the endpoint garbage-collected
+
+    close(bound);
+}
+
+TEST_F(TcpConnectTest, OpenDoesNotBlock)
+{
+    unsigned long port = 0;
+    int helper = -1;
+    int listener = open_stalled_listener(port, helper);
+    ASSERT_GE(listener, 0);
+
+    TestTcpEndpoint tcp{};
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(tcp.open("127.0.0.1", port));
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+    EXPECT_TRUE(tcp.connecting());
+    // the attempt really is stalled: still pending well after open() returned
+    EXPECT_FALSE(wait_writable(tcp.fd, 100));
+
+    close(helper);
+    close(listener);
+}
+
+TEST_F(TcpConnectTest, WriteSkippedWhileConnecting)
+{
+    unsigned long port = 0;
+    int helper = -1;
+    int listener = open_stalled_listener(port, helper);
+    ASSERT_GE(listener, 0);
+
+    TestTcpEndpoint tcp{};
+    ASSERT_TRUE(tcp.open("127.0.0.1", port));
+    ASSERT_TRUE(tcp.connecting());
+
+    // guards return before any buffer field is inspected
+    buffer test_msg{};
+    EXPECT_EQ(tcp.write_msg(&test_msg), 0);
+    EXPECT_EQ(tcp.accept_msg(&test_msg), Endpoint::AcceptState::Rejected);
+
+    close(helper);
+    close(listener);
 }
 
 /**
