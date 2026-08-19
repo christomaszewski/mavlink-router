@@ -1523,7 +1523,6 @@ bool TcpEndpoint::setup(TcpEndpointConfig conf)
         return true;
     }
 
-    Mainloop::get_instance().add_fd(fd, this, EPOLLIN);
     return true;
 }
 
@@ -1566,7 +1565,7 @@ int TcpEndpoint::accept(int listener_fd)
 
 int TcpEndpoint::open_ipv6(const char *ip, unsigned long port, sockaddr_in6 &sockaddr6)
 {
-    auto fd = socket(AF_INET6, SOCK_STREAM, 0);
+    auto fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd == -1) {
         log_error("Could not create IPv6 socket for %s:%lu (%m)", ip, port);
         return -1;
@@ -1603,7 +1602,7 @@ fail:
 
 int TcpEndpoint::open_ipv4(const char *ip, unsigned long port, sockaddr_in &sockaddr)
 {
-    auto fd = socket(AF_INET, SOCK_STREAM, 0);
+    auto fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd == -1) {
         log_error("Could not create IPv4 socket for %s:%lu (%m)", ip, port);
         return -1;
@@ -1644,25 +1643,74 @@ bool TcpEndpoint::open(const std::string &ip, unsigned long port)
         goto fail;
     }
 
-    if (connect(fd, sock, addrlen) < 0) {
+    /* The socket is non-blocking (SOCK_NONBLOCK), so the handshake never stalls the event
+     * loop: connect() returns EINPROGRESS and completion is signaled via EPOLLOUT, handled
+     * in handle_canwrite() -> _complete_connect(). */
+    if (connect(fd, sock, addrlen) == 0) {
+        /* immediately established (can happen e.g. on loopback) */
+        log_info("Opened TCP Client [%d]%s: %s:%lu", fd, _name.c_str(), ip.c_str(), port);
+        _valid = true;
+        Mainloop::get_instance().add_fd(fd, this, EPOLLIN);
+        return true;
+    }
+
+    if (errno != EINPROGRESS) {
         log_error("%d Error connecting to %s:%lu (%m)", fd, ip.c_str(), port);
         goto fail;
     }
 
-    if (fcntl(fd, F_SETFL, O_NONBLOCK | FASYNC) < 0) {
-        log_error("Error setting socket fd as non-blocking for %s:%lu (%m)", ip.c_str(), port);
-        goto fail;
-    }
-
-    log_info("Opened TCP Client [%d]%s: %s:%lu", fd, _name.c_str(), ip.c_str(), port);
-
-    _valid = true;
+    log_debug("TCP [%d]%s: Connection to %s:%lu in progress", fd, _name.c_str(), ip.c_str(), port);
+    _connecting = true;
+    /* EPOLLOUT only: no data can arrive before the handshake completes, and a failed
+     * connect is reported as EPOLLOUT together with EPOLLERR/EPOLLHUP regardless of the
+     * requested event mask, so completion can never be missed. */
+    Mainloop::get_instance().add_fd(fd, this, EPOLLOUT);
     return true;
 
 fail:
     ::close(fd);
     fd = -1;
     return false;
+}
+
+bool TcpEndpoint::handle_canwrite()
+{
+    if (_connecting) {
+        return _complete_connect();
+    }
+    return Endpoint::handle_canwrite();
+}
+
+bool TcpEndpoint::_complete_connect()
+{
+    int so_error = 0;
+    socklen_t so_len = sizeof(so_error);
+
+    _connecting = false;
+
+    /* SO_ERROR is read-and-clear: read it exactly once, here. */
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0) {
+        so_error = errno;
+    }
+
+    if (so_error != 0) {
+        log_error("TCP [%d]%s: Could not connect to %s:%lu (%s)",
+                  fd,
+                  _name.c_str(),
+                  _ip.c_str(),
+                  _port,
+                  strerror(so_error));
+        /* close() before _schedule_reconnect(): the latter returns early without closing
+         * when RetryTimeout <= 0, which would leave a failed fd armed for EPOLLOUT and
+         * busy-loop the level-triggered event loop. */
+        this->close();
+        this->_schedule_reconnect();
+        return true; /* fd is gone; prevent the mainloop from calling mod_fd() on it */
+    }
+
+    log_info("Opened TCP Client [%d]%s: %s:%lu", fd, _name.c_str(), _ip.c_str(), _port);
+    _valid = true;
+    return false; /* the mainloop now switches this fd from EPOLLOUT to EPOLLIN */
 }
 
 ssize_t TcpEndpoint::_read_msg(uint8_t *buf, size_t len)
@@ -1706,8 +1754,8 @@ int TcpEndpoint::write_msg(const struct buffer *pbuf)
     struct sockaddr *sock;
     socklen_t addrlen;
 
-    if (fd < 0) {
-        // skip this endpoint if not connected (e.g. during reconnect)
+    if (fd < 0 || _connecting) {
+        // skip this endpoint if not connected (e.g. while connecting or during reconnect)
         return 0;
     }
 
@@ -1759,8 +1807,8 @@ int TcpEndpoint::write_msg(const struct buffer *pbuf)
 
 Endpoint::AcceptState TcpEndpoint::accept_msg(const struct buffer *pbuf) const
 {
-    // reject when TCP endpoint is not connected (but trying to re-connect)
-    if (this->fd == -1) {
+    // reject when TCP endpoint is not connected yet (still connecting, or re-connecting)
+    if (this->fd == -1 || _connecting) {
         return Endpoint::AcceptState::Rejected;
     }
 
@@ -1778,6 +1826,7 @@ void TcpEndpoint::close()
     }
 
     fd = -1;
+    _connecting = false;
 }
 
 bool TcpEndpoint::validate_config(const TcpEndpointConfig &config)
@@ -1833,8 +1882,6 @@ bool TcpEndpoint::_retry_timeout_cb(void *data)
     if (!tcp->reopen()) {
         return true; // try again
     }
-
-    Mainloop::get_instance().add_fd(fd, tcp, EPOLLIN);
 
     return false; // connection is fine now, no retry
 }

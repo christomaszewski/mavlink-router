@@ -19,14 +19,18 @@
 #include "autolog.h"
 #include "binlog.h"
 #include "endpoint.h"
+#include "mainloop.h"
 #include "tlog.h"
 #include "ulog.h"
 
 #include <limits.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <chrono>
 
 #include <gtest/gtest.h>
 
@@ -761,6 +765,122 @@ TEST(TcpEndpointTest, ConfigValidatePort)
     config.port = 0;
     EXPECT_FALSE(TcpEndpoint::validate_config(config))
         << "with port " << std::to_string(config.port);
+}
+
+class TestTcpEndpoint : public TcpEndpoint {
+public:
+    TestTcpEndpoint()
+        : TcpEndpoint{"tcp-test"}
+    {
+    }
+    using TcpEndpoint::open;
+    bool connecting() const { return _connecting; }
+};
+
+// TCP client connect tests need a Mainloop instance: open() registers the fd with epoll, and a
+// failed connect completion unregisters it again.
+class TcpConnectTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        Mainloop &mainloop = Mainloop::init();
+        // returns -EBUSY when a previous test left the epoll fd open -- that instance works fine
+        mainloop.open();
+    }
+    void TearDown() override { Mainloop::teardown(); }
+
+    // listening socket on an ephemeral loopback port; port returned by reference
+    static int open_listener(unsigned long &port)
+    {
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            return -1;
+        }
+        struct sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t addrlen = sizeof(addr);
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0
+            || getsockname(fd, (struct sockaddr *)&addr, &addrlen) < 0 || listen(fd, 1) < 0) {
+            close(fd);
+            return -1;
+        }
+        port = ntohs(addr.sin_port);
+        return fd;
+    }
+
+    static bool wait_writable(int fd, int timeout_ms)
+    {
+        struct pollfd pfd = {};
+        pfd.fd = fd;
+        pfd.events = POLLOUT;
+        return poll(&pfd, 1, timeout_ms) == 1;
+    }
+};
+
+TEST_F(TcpConnectTest, AsyncConnectSuccess)
+{
+    unsigned long port;
+    int listener = open_listener(port);
+    ASSERT_GE(listener, 0);
+
+    TestTcpEndpoint tcp{};
+    ASSERT_TRUE(tcp.open("127.0.0.1", port));
+    if (tcp.connecting()) { // loopback may also connect immediately
+        ASSERT_TRUE(wait_writable(tcp.fd, 2000));
+        EXPECT_FALSE(tcp.handle_canwrite()); // false: mainloop switches EPOLLOUT -> EPOLLIN
+    }
+    EXPECT_FALSE(tcp.connecting());
+    EXPECT_GE(tcp.fd, 0);
+    EXPECT_TRUE(tcp.is_valid());
+
+    close(listener);
+}
+
+TEST_F(TcpConnectTest, AsyncConnectRefused)
+{
+    // bind an ephemeral port, then close it again: connecting to it gets a fast RST
+    unsigned long port;
+    int listener = open_listener(port);
+    ASSERT_GE(listener, 0);
+    close(listener);
+
+    TestTcpEndpoint tcp{};
+    if (!tcp.open("127.0.0.1", port)) {
+        return; // synchronous failure is acceptable, nothing more to check
+    }
+    if (tcp.connecting()) {
+        ASSERT_TRUE(wait_writable(tcp.fd, 2000));
+        EXPECT_TRUE(tcp.handle_canwrite()); // true: fd already closed, no mod_fd wanted
+    }
+    EXPECT_EQ(tcp.fd, -1);
+    EXPECT_FALSE(tcp.connecting());
+    EXPECT_TRUE(tcp.is_valid()); // a refused connect must not get the endpoint garbage-collected
+}
+
+TEST_F(TcpConnectTest, OpenDoesNotBlock)
+{
+    // 192.0.2.1 (TEST-NET-1) is guaranteed unroutable: environments split between instant
+    // ENETUNREACH and EINPROGRESS-then-hang, but a non-blocking connect returns immediately
+    // in both cases -- so assert ONLY the elapsed time
+    TestTcpEndpoint tcp{};
+    auto start = std::chrono::steady_clock::now();
+    tcp.open("192.0.2.1", 5760);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    EXPECT_LT(elapsed, std::chrono::seconds(1));
+}
+
+TEST_F(TcpConnectTest, WriteSkippedWhileConnecting)
+{
+    TestTcpEndpoint tcp{};
+    if (!tcp.open("192.0.2.1", 5760) || !tcp.connecting()) {
+        GTEST_SKIP() << "environment rejects TEST-NET-1 synchronously; no connecting state";
+    }
+
+    // guards return before any buffer field is inspected
+    buffer test_msg{};
+    EXPECT_EQ(tcp.write_msg(&test_msg), 0);
+    EXPECT_EQ(tcp.accept_msg(&test_msg), Endpoint::AcceptState::Rejected);
 }
 
 /**

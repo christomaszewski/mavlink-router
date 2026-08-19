@@ -288,6 +288,12 @@ int Mainloop::loop()
                 }
             }
 
+            if (p->fd < 0) {
+                // the pollable closed its fd while handling the events above (e.g. a failed
+                // TCP connect attempt); any remaining events refer to the closed fd
+                continue;
+            }
+
             if (events[i].events & EPOLLERR) {
                 log_error("poll error for fd %i", p->fd);
 
