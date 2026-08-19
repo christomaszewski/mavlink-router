@@ -798,6 +798,7 @@ public:
     {
     }
     void set_file(int file) { _file = file; }
+    void use_writer(std::shared_ptr<LogWriter> writer) { _writer = writer; }
 };
 
 TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
@@ -812,8 +813,10 @@ TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
     int file = mkstemp(path);
     ASSERT_GE(file, 0);
 
+    auto writer = LogWriter::instance();
     TestTLog tlog{conf};
     tlog.set_file(file);
+    tlog.use_writer(writer);
 
     uint8_t payload[64];
     memset(payload, 0x6C, sizeof(payload));
@@ -824,6 +827,7 @@ TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
     msg.curr.msg_id = 1; // not a heartbeat
 
     EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+    writer->drain(); // the record is written by the background writer
 
     // one record: 8-byte big-endian microsecond timestamp, then the payload verbatim
     uint8_t content[128];
@@ -838,6 +842,116 @@ TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
 
     close(file);
     unlink(path);
+}
+
+/**
+ * LogWriter (background log IO)
+ */
+
+TEST(LogWriterTest, FifoByteExactAcrossFiles)
+{
+    char path_a[] = "/tmp/logwriter_a_XXXXXX";
+    char path_b[] = "/tmp/logwriter_b_XXXXXX";
+    int fd_a = mkstemp(path_a);
+    int fd_b = mkstemp(path_b);
+    ASSERT_GE(fd_a, 0);
+    ASSERT_GE(fd_b, 0);
+
+    auto writer = LogWriter::instance();
+    uint8_t block[100];
+
+    memset(block, 0xA1, sizeof(block));
+    EXPECT_TRUE(writer->write(fd_a, block, sizeof(block)));
+    memset(block, 0xB1, sizeof(block));
+    EXPECT_TRUE(writer->write(fd_b, block, sizeof(block)));
+    memset(block, 0xA2, sizeof(block));
+    EXPECT_TRUE(writer->write(fd_a, block, sizeof(block)));
+    memset(block, 0xB2, sizeof(block));
+    EXPECT_TRUE(writer->pwrite(fd_b, block, sizeof(block), 100));
+    writer->drain();
+
+    uint8_t content[256];
+    ASSERT_EQ(pread(fd_a, content, sizeof(content), 0), 200);
+    EXPECT_TRUE(std::all_of(content, content + 100, [](uint8_t b) { return b == 0xA1; }));
+    EXPECT_TRUE(std::all_of(content + 100, content + 200, [](uint8_t b) { return b == 0xA2; }));
+    ASSERT_EQ(pread(fd_b, content, sizeof(content), 0), 200);
+    EXPECT_TRUE(std::all_of(content, content + 100, [](uint8_t b) { return b == 0xB1; }));
+    EXPECT_TRUE(std::all_of(content + 100, content + 200, [](uint8_t b) { return b == 0xB2; }));
+
+    close(fd_a);
+    close(fd_b);
+    unlink(path_a);
+    unlink(path_b);
+}
+
+TEST(LogWriterTest, SyncCloseMarksFileReadOnly)
+{
+    char path[] = "/tmp/logwriter_c_XXXXXX";
+    int file = mkstemp(path);
+    ASSERT_GE(file, 0);
+
+    auto writer = LogWriter::instance();
+    uint8_t block[64];
+    memset(block, 0xC3, sizeof(block));
+    EXPECT_TRUE(writer->write(file, block, sizeof(block)));
+    EXPECT_TRUE(writer->sync_close(file, path)); // worker owns the fd from here
+    writer->drain();
+
+    struct stat st;
+    ASSERT_EQ(stat(path, &st), 0);
+    EXPECT_EQ(st.st_size, 64);
+    EXPECT_EQ(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH), 0u); // finished log is read-only
+    unlink(path);
+}
+
+TEST(LogWriterTest, FullQueueDropsButNeverBlocks)
+{
+    // A pipe nobody reads: the worker blocks writing it (the "slow storage" stand-in), the
+    // ring fills, and further enqueues must return false immediately instead of blocking.
+    int pfd[2];
+    ASSERT_EQ(pipe(pfd), 0);
+
+    auto writer = LogWriter::instance();
+    constexpr size_t RECLEN = LogWriter::DATA_MAX;
+    constexpr uint32_t TOTAL = 200; // > ring capacity + what the pipe buffer absorbs
+    uint8_t record[RECLEN];
+
+    uint32_t accepted = 0;
+    for (uint32_t i = 0; i < TOTAL; i++) {
+        memcpy(record, &i, sizeof(i)); // per-record sequence number for the FIFO check
+        if (writer->write(pfd[1], record, RECLEN)) {
+            accepted++;
+        }
+    }
+    EXPECT_GT(writer->dropped(), 0u);
+    EXPECT_EQ(accepted + writer->dropped(), TOTAL);
+
+    // unblock the worker: consume everything it was asked to write
+    std::vector<uint8_t> got;
+    uint8_t chunk[4096];
+    while (got.size() < accepted * RECLEN) {
+        ssize_t n = read(pfd[0], chunk, sizeof(chunk));
+        ASSERT_GT(n, 0);
+        got.insert(got.end(), chunk, chunk + n);
+    }
+    writer->drain();
+    ASSERT_EQ(got.size(), accepted * RECLEN);
+
+    // accepted records arrive whole and in order (sequence numbers strictly increasing)
+    uint32_t prev = 0;
+    bool first = true;
+    for (size_t off = 0; off < got.size(); off += RECLEN) {
+        uint32_t seq;
+        memcpy(&seq, got.data() + off, sizeof(seq));
+        if (!first) {
+            ASSERT_GT(seq, prev);
+        }
+        prev = seq;
+        first = false;
+    }
+
+    close(pfd[0]);
+    close(pfd[1]);
 }
 
 TEST(LogEndpointTest, Init)

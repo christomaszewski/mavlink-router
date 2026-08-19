@@ -375,21 +375,26 @@ void LogEndpoint::stop()
         _timeout.fsync = nullptr;
     }
 
-    fsync(_file);
-    close(_file);
-    _file = -1;
-    _fsync_cb.aio_fildes = -1;
-
-    // change file permissions to read-only to mark them as finished
+    /* mark the log finished right away — chmod is a cheap in-memory metadata update, and
+     * the retention scan below only counts read-only files — then hand the file to the
+     * background writer for the expensive part: the final fsync and the close. Disarm no
+     * longer waits on the disk. */
     char log_file[PATH_MAX];
     if (snprintf(log_file, sizeof(log_file), "%s/%s", _config.logs_dir.c_str(), _filename)
         < (int)sizeof(log_file)) {
         chmod(log_file, S_IRUSR | S_IRGRP | S_IROTH);
     }
+    if (!_writer || !_writer->sync_close(_file, nullptr)) {
+        // no writer or full ring: synchronous fallback beats leaking the fd
+        fsync(_file);
+        close(_file);
+    }
+    _file = -1;
+    _fsync_cb.aio_fildes = -1;
 
-    /* reclaim space now, while nothing is being logged: the just-finished log is read-only
-     * and counted, and the next start() finds a compliant directory without scanning it on
-     * the routing hot path */
+    /* reclaim space now, while nothing is being logged: the just-finished log is counted,
+     * and the next start() finds a compliant directory without scanning it on the routing
+     * hot path */
     _delete_old_logs();
 }
 
@@ -412,6 +417,10 @@ bool LogEndpoint::start()
     if (_file < 0) {
         _file = -1;
         return false;
+    }
+
+    if (!_writer) {
+        _writer = LogWriter::instance();
     }
 
     _timeout.logging_start = Mainloop::get_instance().add_timeout(
@@ -493,20 +502,21 @@ void LogEndpoint::_sync_dir_entry(int dir_fd)
 
 ssize_t LogEndpoint::_log_write(const void *buf, size_t len)
 {
-    ssize_t r = ::write(_file, buf, len);
-    if (r == -1) {
-        return errno == EAGAIN ? -EAGAIN : -errno;
+    /* hand the data to the background writer: the routing thread never touches the disk.
+     * A full queue reports -EAGAIN — callers keep the data (ULog's own buffer) or drop it
+     * (best-effort formats), and BinLog withholds the ack so the flight stack resends. */
+    if (!_writer) {
+        return -EINVAL;
     }
-    return r;
+    return _writer->write(_file, buf, len) ? (ssize_t)len : -EAGAIN;
 }
 
 ssize_t LogEndpoint::_log_pwrite(const void *buf, size_t len, off_t offset)
 {
-    ssize_t r = ::pwrite(_file, buf, len, offset);
-    if (r == -1) {
-        return errno == EAGAIN ? -EAGAIN : -errno;
+    if (!_writer) {
+        return -EINVAL;
     }
-    return r;
+    return _writer->pwrite(_file, buf, len, offset) ? (ssize_t)len : -EAGAIN;
 }
 
 bool LogEndpoint::_fsync()
