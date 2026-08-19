@@ -491,6 +491,24 @@ void LogEndpoint::_sync_dir_entry(int dir_fd)
     }
 }
 
+ssize_t LogEndpoint::_log_write(const void *buf, size_t len)
+{
+    ssize_t r = ::write(_file, buf, len);
+    if (r == -1) {
+        return errno == EAGAIN ? -EAGAIN : -errno;
+    }
+    return r;
+}
+
+ssize_t LogEndpoint::_log_pwrite(const void *buf, size_t len, off_t offset)
+{
+    ssize_t r = ::pwrite(_file, buf, len, offset);
+    if (r == -1) {
+        return errno == EAGAIN ? -EAGAIN : -errno;
+    }
+    return r;
+}
+
 bool LogEndpoint::_fsync()
 {
     // reap a finished directory-entry sync (frees its dup()ed fd)
