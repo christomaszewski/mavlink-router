@@ -61,6 +61,10 @@ Mainloop &Mainloop::init()
 
     _initialized = true;
 
+    // a fresh instance must not inherit an exit request from an earlier loop() run (the tests
+    // tear the singleton down and initialise it again)
+    should_exit.store(false, std::memory_order_relaxed);
+
     return _instance;
 }
 
@@ -282,8 +286,22 @@ int Mainloop::loop()
                 }
             }
 
+            if (p->fd < 0) {
+                // the pollable closed its fd in handle_read() (e.g. a TCP peer hung up while
+                // EPOLLOUT was armed): there is nothing left to write to, and the remaining
+                // event bits refer to the closed fd
+                continue;
+            }
+
             if (events[i].events & EPOLLOUT) {
-                if (!p->handle_canwrite()) {
+                bool pending = p->handle_canwrite();
+
+                if (p->fd < 0) {
+                    // closed in handle_canwrite() (e.g. a failed TCP connect attempt)
+                    continue;
+                }
+
+                if (!pending) {
                     mod_fd(p->fd, p, EPOLLIN);
                 }
             }
