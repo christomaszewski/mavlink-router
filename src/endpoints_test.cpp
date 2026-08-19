@@ -19,11 +19,14 @@
 #include "autolog.h"
 #include "binlog.h"
 #include "endpoint.h"
+#include "mainloop.h"
 #include "tlog.h"
 #include "ulog.h"
 
 #include <fcntl.h>
 #include <limits.h>
+#include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -907,6 +910,72 @@ TEST(UdpEndpointTest, ConfigValidateMode)
     // build invalid mode
     config.mode = UdpEndpointConfig::Mode::Undefined;
     EXPECT_FALSE(UdpEndpoint::validate_config(config)) << "with Undefined mode";
+}
+
+class UdpTxTestEndpoint : public UdpEndpoint {
+public:
+    UdpTxTestEndpoint()
+        : UdpEndpoint{"udp-tx-test"}
+    {
+    }
+    using UdpEndpoint::open;
+    size_t queued_frames() const { return _tx_pending_lens.size(); }
+};
+
+// UDP datagram-queue semantics (enqueue on EAGAIN, whole-datagram resend, drop-oldest) are
+// covered by the scripted TxQueueTest suite: a real loopback UDP socket cannot produce a
+// deterministic EAGAIN (loopback drops instead of blocking). These are transport smoke tests.
+class UdpTxTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        Mainloop &mainloop = Mainloop::init();
+        // returns -EBUSY when a previous test left the epoll fd open -- that instance works fine
+        mainloop.open();
+    }
+    void TearDown() override { Mainloop::teardown(); }
+};
+
+TEST_F(UdpTxTest, ClientModeSendsWholeDatagrams)
+{
+    int rx = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(rx, 0);
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(rx, (struct sockaddr *)&addr, sizeof(addr)), 0);
+    socklen_t alen = sizeof(addr);
+    ASSERT_EQ(getsockname(rx, (struct sockaddr *)&addr, &alen), 0);
+
+    UdpTxTestEndpoint udp{};
+    ASSERT_TRUE(udp.open("127.0.0.1", ntohs(addr.sin_port), UdpEndpointConfig::Mode::Client));
+
+    std::vector<uint8_t> s;
+    struct buffer f = make_frame(s, 0x5A, 200);
+    EXPECT_EQ(udp.write_msg(&f), (int)f.len);
+    EXPECT_EQ(udp.flush_pending_msgs(), 0);
+    EXPECT_EQ(udp.queued_frames(), 0u);
+
+    struct pollfd pfd = {};
+    pfd.fd = rx;
+    pfd.events = POLLIN;
+    ASSERT_EQ(poll(&pfd, 1, 2000), 1);
+    uint8_t rbuf[512];
+    ssize_t n = recv(rx, rbuf, sizeof(rbuf), 0);
+    ASSERT_EQ(n, 200);
+    EXPECT_TRUE(std::all_of(rbuf, rbuf + 200, [](uint8_t b) { return b == 0x5A; }));
+    close(rx);
+}
+
+TEST_F(UdpTxTest, ServerModeWithoutPeerWritesNothing)
+{
+    UdpTxTestEndpoint udp{};
+    ASSERT_TRUE(udp.open("127.0.0.1", 0, UdpEndpointConfig::Mode::Server));
+
+    std::vector<uint8_t> s;
+    struct buffer f = make_frame(s, 0x5B, 100);
+    EXPECT_EQ(udp.write_msg(&f), 0); // no peer has spoken yet: nothing to write for
+    EXPECT_EQ(udp.queued_frames(), 0u);
 }
 
 /**
