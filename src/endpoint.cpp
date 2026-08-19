@@ -1510,7 +1510,6 @@ bool TcpEndpoint::setup(TcpEndpointConfig conf)
         return true;
     }
 
-    Mainloop::get_instance().add_fd(fd, this, EPOLLIN);
     return true;
 }
 
@@ -1638,6 +1637,7 @@ bool TcpEndpoint::open(const std::string &ip, unsigned long port)
     log_info("Opened TCP Client [%d]%s: %s:%lu", fd, _name.c_str(), ip.c_str(), port);
 
     _valid = true;
+    Mainloop::get_instance().add_fd(fd, this, EPOLLIN);
     return true;
 
 fail:
@@ -1814,8 +1814,6 @@ bool TcpEndpoint::_retry_timeout_cb(void *data)
     if (!tcp->reopen()) {
         return true; // try again
     }
-
-    Mainloop::get_instance().add_fd(fd, tcp, EPOLLIN);
 
     return false; // connection is fine now, no retry
 }
