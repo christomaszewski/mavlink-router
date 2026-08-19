@@ -366,6 +366,7 @@ public:
 
     int write_msg(const struct buffer *pbuf) override;
     int flush_pending_msgs() override { return -ENOSYS; }
+    bool handle_canwrite() override;
     bool is_valid() override { return _valid; };
     bool is_critical() override { return false; };
 
@@ -390,7 +391,12 @@ protected:
     void _schedule_reconnect();
     bool _retry_timeout_cb(void *data);
 
+    /// connect() in progress: fd is valid and armed for EPOLLOUT (fd == -1 implies false)
+    bool _connecting = false;
+
 private:
+    bool _complete_connect();
+
     std::string _ip{};
     unsigned long _port = 0;
     bool _valid = true;
