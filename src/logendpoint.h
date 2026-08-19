@@ -19,7 +19,6 @@
 
 #include <common/conf_file.h>
 
-#include <aio.h>
 #include <assert.h>
 #include <dirent.h>
 
@@ -82,8 +81,6 @@ protected:
         Timeout *alive = nullptr;
     } _timeout;
     uint32_t _timeout_write_total = 0;
-    aiocb _fsync_cb = {};
-    aiocb _dir_fsync_cb = {};           ///< in-flight async fsync of the log dir; owns a dup()ed fd
     std::shared_ptr<LogWriter> _writer; ///< background writer, shared by all log endpoints
 
     virtual const char *_get_logfile_extension() = 0;
