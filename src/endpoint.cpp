@@ -1610,6 +1610,7 @@ bool TcpEndpoint::open(const std::string &ip, unsigned long port)
     // setup the special IPv6/IPv4 part
     struct sockaddr *sock;
     socklen_t addrlen;
+    int tcp_nodelay_state = 1;
     if (this->is_ipv6) {
         fd = open_ipv6(ip.c_str(), port, this->sockaddr6);
         sock = (struct sockaddr *)&this->sockaddr6;
@@ -1625,6 +1626,11 @@ bool TcpEndpoint::open(const std::string &ip, unsigned long port)
     }
 
     // common setup
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&tcp_nodelay_state, sizeof(int)) < 0) {
+        log_error("Error setting TCP_NODELAY on [%d]%s (%m)", fd, _name.c_str());
+        goto fail;
+    }
+
     if (connect(fd, sock, addrlen) < 0) {
         log_error("%d Error connecting to %s:%lu (%m)", fd, ip.c_str(), port);
         goto fail;
