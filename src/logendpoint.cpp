@@ -65,6 +65,7 @@ LogEndpoint::LogEndpoint(std::string name, LogOptions conf)
     assert(!_config.logs_dir.empty());
     _add_sys_comp_id(LOG_ENDPOINT_SYSTEM_ID, 0);
     _fsync_cb.aio_fildes = -1;
+    _dir_fsync_cb.aio_fildes = -1;
 
 #if HAVE_DECL_AIO_INIT
     aioinit aio_init_data{};
@@ -346,10 +347,8 @@ int LogEndpoint::_get_file(const char *extension)
             continue;
         }
 
-        // Ensure the directory entry of the file is written to disk
-        if (fsync(dir_fd) == -1) {
-            log_error("fsync failed: %m");
-        }
+        // Ensure the directory entry of the file gets written to disk
+        _sync_dir_entry(dir_fd);
 
         return r;
     }
@@ -458,8 +457,48 @@ bool LogEndpoint::_alive_timeout()
     return true;
 }
 
+void LogEndpoint::_sync_dir_entry(int dir_fd)
+{
+    /* A synchronous fsync of the log directory can stall for hundreds of milliseconds on SD
+     * storage right after deletions — and _get_file() runs on the routing thread at arm
+     * time. Hand the barrier to the aio helper thread instead (the same machinery as the
+     * 1 Hz data flush). The fd is dup()ed because the caller closes its directory handle. */
+    if (_dir_fsync_cb.aio_fildes >= 0) {
+        if (aio_error(&_dir_fsync_cb) == EINPROGRESS) {
+            // previous sync of the same directory still covers this entry eventually
+            return;
+        }
+        close(_dir_fsync_cb.aio_fildes);
+        _dir_fsync_cb.aio_fildes = -1;
+    }
+
+    int fd_copy = dup(dir_fd);
+    if (fd_copy < 0) {
+        if (fsync(dir_fd) == -1) { // synchronous fallback beats losing the barrier
+            log_error("fsync failed: %m");
+        }
+        return;
+    }
+
+    _dir_fsync_cb.aio_fildes = fd_copy;
+    _dir_fsync_cb.aio_sigevent.sigev_notify = SIGEV_NONE;
+    if (aio_fsync(O_SYNC, &_dir_fsync_cb) < 0) {
+        close(fd_copy);
+        _dir_fsync_cb.aio_fildes = -1;
+        if (fsync(dir_fd) == -1) {
+            log_error("fsync failed: %m");
+        }
+    }
+}
+
 bool LogEndpoint::_fsync()
 {
+    // reap a finished directory-entry sync (frees its dup()ed fd)
+    if (_dir_fsync_cb.aio_fildes >= 0 && aio_error(&_dir_fsync_cb) != EINPROGRESS) {
+        close(_dir_fsync_cb.aio_fildes);
+        _dir_fsync_cb.aio_fildes = -1;
+    }
+
     if (_file < 0) {
         return false;
     }

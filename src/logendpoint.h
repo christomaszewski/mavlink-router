@@ -80,6 +80,7 @@ protected:
     } _timeout;
     uint32_t _timeout_write_total = 0;
     aiocb _fsync_cb = {};
+    aiocb _dir_fsync_cb = {}; ///< in-flight async fsync of the log dir; owns a dup()ed fd
 
     virtual const char *_get_logfile_extension() = 0;
 
@@ -91,6 +92,7 @@ protected:
     virtual bool _alive_timeout();
 
     bool _fsync();
+    void _sync_dir_entry(int dir_fd);
 
     void _handle_auto_start_stop(const struct buffer *pbuf);
 
