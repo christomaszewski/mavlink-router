@@ -217,6 +217,173 @@ bool Endpoint::handle_canwrite()
     return r == -EAGAIN;
 }
 
+int Endpoint::flush_pending_msgs()
+{
+    /* the unsent tail of a partially-written frame always goes first: its head is already on
+     * the wire, so the stream stays intact only if these bytes precede everything else */
+    while (_tx_partial_len > 0) {
+        ssize_t r = _write_raw(_tx_partial, _tx_partial_len);
+        if (r == -EAGAIN) {
+            return -EAGAIN;
+        }
+        if (r < 0) {
+            _tx_partial_len = 0;
+            _stat.write.drops++;
+            _dropped_msgs++;
+            return (int)r;
+        }
+        _stat.write.bytes += r;
+        if ((uint16_t)r < _tx_partial_len) {
+            memmove(_tx_partial, _tx_partial + r, _tx_partial_len - r);
+        }
+        _tx_partial_len -= (uint16_t)r;
+    }
+
+    while (!_tx_pending_lens.empty()) {
+        uint16_t frame_len = _tx_pending_lens.front();
+        ssize_t r = _write_raw(tx_buf.data + _tx_head, frame_len);
+        if (r == -EAGAIN) {
+            return -EAGAIN;
+        }
+        if (r < 0) {
+            if (_tx_pending_lens.empty()) {
+                /* _write_raw cleared the queue underneath us (e.g. TCP write error triggered
+                 * a reconnect, which closes and clears) — nothing left to account for */
+                return (int)r;
+            }
+            _tx_queue_consume_front();
+            _stat.write.drops++;
+            _dropped_msgs++;
+            return (int)r;
+        }
+
+        _stat.write.total++;
+        _stat.write.bytes += r;
+
+        if ((size_t)r == frame_len) {
+            _tx_queue_consume_front();
+            continue;
+        }
+
+        if (_tx_is_stream) {
+            /* short write: the frame's head is on the wire; stash the unsent tail */
+            memcpy(_tx_partial, tx_buf.data + _tx_head + r, frame_len - r);
+            _tx_partial_len = (uint16_t)(frame_len - r);
+            _tx_queue_consume_front();
+            return -EAGAIN;
+        }
+
+        /* a datagram cannot be resumed; count it like a short sendto */
+        _incomplete_msgs++;
+        _tx_queue_consume_front();
+    }
+
+    return 0;
+}
+
+int Endpoint::_tx_send_or_queue(const struct buffer *pbuf)
+{
+    /* send pending data first, so frames leave in FIFO order */
+    if (_tx_partial_len > 0 || !_tx_pending_lens.empty()) {
+        int flush = flush_pending_msgs();
+        if (_tx_partial_len > 0 || !_tx_pending_lens.empty()) {
+            _tx_queue_frame(pbuf);
+            return -EAGAIN;
+        }
+        if (flush < 0 && flush != -EAGAIN) {
+            return flush; /* hard error (e.g. -EPIPE) — route_msg needs to see it */
+        }
+    }
+
+    ssize_t r = _write_raw(pbuf->data, pbuf->len);
+    if (r == -EAGAIN) {
+        _tx_queue_frame(pbuf);
+        return -EAGAIN;
+    }
+    if (r < 0) {
+        return (int)r;
+    }
+
+    _stat.write.total++;
+    _stat.write.bytes += r;
+
+    if ((size_t)r < pbuf->len) {
+        if (_tx_is_stream) {
+            /* short write: buffer the unsent tail instead of putting a torn frame on the
+             * wire and discarding the rest */
+            memcpy(_tx_partial, pbuf->data + r, pbuf->len - r);
+            _tx_partial_len = (uint16_t)(pbuf->len - r);
+            return -EAGAIN;
+        }
+        _incomplete_msgs++;
+    }
+
+    return (int)pbuf->len;
+}
+
+void Endpoint::_tx_queue_frame(const struct buffer *pbuf)
+{
+    if (pbuf->len > TX_BUF_MAX_SIZE) {
+        _stat.write.drops++;
+        _dropped_msgs++;
+        return;
+    }
+
+    /* drop-oldest: periodic state (attitude, position, heartbeats) dominates MAVLink
+     * traffic, so the freshest data and protocol retries displace the stalest samples */
+    while (TX_BUF_MAX_SIZE - (tx_buf.len - _tx_head) < pbuf->len) {
+        _tx_queue_consume_front();
+        _stat.write.drops++;
+        _dropped_msgs++;
+    }
+
+    /* compact when the tail has no room but the head has */
+    if (tx_buf.len + pbuf->len > TX_BUF_MAX_SIZE) {
+        memmove(tx_buf.data, tx_buf.data + _tx_head, tx_buf.len - _tx_head);
+        tx_buf.len -= _tx_head;
+        _tx_head = 0;
+    }
+
+    memcpy(tx_buf.data + tx_buf.len, pbuf->data, pbuf->len);
+    tx_buf.len += pbuf->len;
+    _tx_pending_lens.push_back((uint16_t)pbuf->len);
+
+    size_t pending = _tx_pending_bytes();
+    if (pending > _stat.write.queue_hwm) {
+        _stat.write.queue_hwm = (uint32_t)pending;
+    }
+}
+
+void Endpoint::_tx_queue_consume_front()
+{
+    _tx_head += _tx_pending_lens.front();
+    _tx_pending_lens.pop_front();
+    if (_tx_pending_lens.empty()) {
+        _tx_head = 0;
+        tx_buf.len = 0;
+    }
+}
+
+void Endpoint::_tx_queue_clear(const char *reason)
+{
+    size_t frames = _tx_pending_lens.size() + (_tx_partial_len > 0 ? 1 : 0);
+    if (frames == 0) {
+        return;
+    }
+    _stat.write.drops += frames;
+    _dropped_msgs += frames;
+    _tx_pending_lens.clear();
+    _tx_head = 0;
+    tx_buf.len = 0;
+    _tx_partial_len = 0;
+    log_debug("%s [%d]%s: TX queue dropped %zu frame(s): %s",
+              _type.c_str(),
+              fd,
+              _name.c_str(),
+              frames,
+              reason);
+}
+
 int Endpoint::handle_read()
 {
     struct buffer buf = {};
@@ -685,6 +852,8 @@ void Endpoint::print_statistics()
     printf("\n\t}");
     printf("\n\tTransmitted messages {");
     printf("\n\t\tTotal: %u %" PRIu64 "KB", _stat.write.total, _stat.write.bytes / 1000);
+    printf("\n\t\tDropped (TX queue full): %u", _stat.write.drops);
+    printf("\n\t\tTX queue high-water: %uB", _stat.write.queue_hwm);
     printf("\n\t}");
     printf("\n}\n");
     fflush(stdout);
@@ -718,6 +887,16 @@ void Endpoint::log_aggregate(unsigned int interval_sec)
                     _incomplete_msgs,
                     interval_sec);
         _incomplete_msgs = 0;
+    }
+    if (_dropped_msgs > 0) {
+        log_warning("%s Endpoint [%d]%s: %u messages dropped (TX queue full) in the last %d "
+                    "seconds",
+                    _type.c_str(),
+                    fd,
+                    _name.c_str(),
+                    _dropped_msgs,
+                    interval_sec);
+        _dropped_msgs = 0;
     }
 }
 
