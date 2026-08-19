@@ -1148,7 +1148,7 @@ protected:
 
 TEST_F(TcpConnectTest, AsyncConnectSuccess)
 {
-    unsigned long port;
+    unsigned long port = 0;
     int listener = open_listener(port);
     ASSERT_GE(listener, 0);
 
@@ -1168,7 +1168,7 @@ TEST_F(TcpConnectTest, AsyncConnectSuccess)
 TEST_F(TcpConnectTest, AsyncConnectRefused)
 {
     // bind an ephemeral port, then close it again: connecting to it gets a fast RST
-    unsigned long port;
+    unsigned long port = 0;
     int listener = open_listener(port);
     ASSERT_GE(listener, 0);
     close(listener);
