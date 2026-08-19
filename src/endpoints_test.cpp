@@ -24,6 +24,7 @@
 
 #include <fcntl.h>
 #include <limits.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -877,6 +878,68 @@ TEST(UartEndpointTest, ConfigValidateDevice)
     // build invalid baud rate
     config.device = "";
     EXPECT_FALSE(UartEndpoint::validate_config(config)) << "with device " << config.device;
+}
+
+class TestUartEndpoint : public UartEndpoint {
+public:
+    TestUartEndpoint()
+        : UartEndpoint{"uart-test"}
+    {
+    }
+    size_t queued_frames() const { return _tx_pending_lens.size(); }
+    uint16_t partial_len() const { return _tx_partial_len; }
+};
+
+// Real-kernel EAGAIN: write over a socketpair with the smallest possible send buffer until the
+// kernel pushes back, then drain and verify the receiver sees the exact byte stream — no torn,
+// missing or duplicated frames.
+TEST(UartEndpointTest, QueueOnBlockedFdPreservesStream)
+{
+    int sp[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    int sndbuf = 1; // the kernel clamps this to its floor — never assume the resulting size
+    ASSERT_EQ(setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+    ASSERT_EQ(fcntl(sp[0], F_SETFL, O_NONBLOCK), 0);
+    ASSERT_EQ(fcntl(sp[1], F_SETFL, O_NONBLOCK), 0);
+
+    TestUartEndpoint uart{};
+    uart.fd = sp[0]; // closed by the endpoint destructor
+
+    // write distinct-patterned frames until the kernel buffer forces queueing, then a few
+    // more — but stay far below queue capacity so no frame is legitimately dropped
+    std::vector<uint8_t> storage, expected;
+    unsigned int extra = 0;
+    for (unsigned int i = 0; i < 200 && extra < 5; i++) {
+        struct buffer f = make_frame(storage, (uint8_t)i, 280);
+        int r = uart.write_msg(&f);
+        ASSERT_TRUE(r == (int)f.len || r == -EAGAIN) << "write_msg returned " << r;
+        expected.insert(expected.end(), storage.begin(), storage.end());
+        if (r == -EAGAIN) {
+            extra++;
+        }
+    }
+    ASSERT_GE(extra, 5u) << "kernel never pushed back; cannot exercise the queue";
+
+    // alternate draining the receiver and flushing until the queue is empty
+    std::vector<uint8_t> received;
+    uint8_t buf[4096];
+    ssize_t n;
+    int flush_ret = -EAGAIN;
+    for (int guard = 0; guard < 1000 && flush_ret == -EAGAIN; guard++) {
+        while ((n = read(sp[1], buf, sizeof(buf))) > 0) {
+            received.insert(received.end(), buf, buf + n);
+        }
+        flush_ret = uart.flush_pending_msgs();
+    }
+    EXPECT_EQ(flush_ret, 0);
+    EXPECT_EQ(uart.queued_frames(), 0u);
+    EXPECT_EQ(uart.partial_len(), 0);
+    while ((n = read(sp[1], buf, sizeof(buf))) > 0) {
+        received.insert(received.end(), buf, buf + n);
+    }
+
+    EXPECT_EQ(received, expected);
+    close(sp[1]);
 }
 
 /**

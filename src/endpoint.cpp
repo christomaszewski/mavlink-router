@@ -1199,29 +1199,26 @@ int UartEndpoint::write_msg(const struct buffer *pbuf)
         return -EINVAL;
     }
 
-    /* TODO: send any pending data */
-    if (tx_buf.len > 0) {
-        ;
+    int r = _tx_send_or_queue(pbuf);
+
+    if (r == -EAGAIN) {
+        log_trace("UART [%d]%s: Queued, %zu bytes pending", fd, _name.c_str(), _tx_pending_bytes());
+    } else if (r >= 0) {
+        log_trace("UART [%d]%s: Wrote %d bytes", fd, _name.c_str(), r);
     }
 
-    ssize_t r = ::write(fd, pbuf->data, pbuf->len);
-    if (r == -1 && errno == EAGAIN) {
-        return -EAGAIN;
+    return r;
+}
+
+ssize_t UartEndpoint::_write_raw(const uint8_t *data, size_t len)
+{
+    ssize_t r = ::write(fd, data, len);
+    if (r == -1) {
+        if (errno == EAGAIN) {
+            return -EAGAIN;
+        }
+        return -errno;
     }
-
-    _stat.write.total++;
-    _stat.write.bytes += pbuf->len;
-
-    /* Incomplete packet, we warn and discard the rest */
-    if (r != (ssize_t)pbuf->len) {
-        _incomplete_msgs++;
-        log_debug("UART %s: Discarding packet, incomplete write %zd but len=%u",
-                  _name.c_str(),
-                  r,
-                  pbuf->len);
-    }
-
-    log_trace("UART [%d]%s: Wrote %zd bytes", fd, _name.c_str(), r);
 
     return r;
 }
