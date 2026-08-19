@@ -344,6 +344,7 @@ protected:
 
     int read_msg(struct buffer *pbuf) override;
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
+    ssize_t _write_raw(const uint8_t *data, size_t len) override;
 
 private:
     size_t _current_baud_idx = 0;
