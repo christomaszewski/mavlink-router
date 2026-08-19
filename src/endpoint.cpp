@@ -1853,56 +1853,42 @@ ssize_t TcpEndpoint::_read_msg(uint8_t *buf, size_t len)
 
 int TcpEndpoint::write_msg(const struct buffer *pbuf)
 {
-    struct sockaddr *sock;
-    socklen_t addrlen;
-
     if (fd < 0) {
         // skip this endpoint if not connected (e.g. during reconnect)
         return 0;
     }
 
-    /* TODO: send any pending data */
-    if (tx_buf.len > 0) {
-        ;
-    }
+    int r = _tx_send_or_queue(pbuf);
 
-    if (this->is_ipv6) {
-        sock = (struct sockaddr *)&sockaddr6;
-        addrlen = sizeof(sockaddr6);
-    } else {
-        sock = (struct sockaddr *)&sockaddr;
-        addrlen = sizeof(sockaddr);
-    }
+    log_trace("TCP [%d]%s: Wrote %d bytes", fd, _name.c_str(), r);
 
-    ssize_t r = ::sendto(fd, pbuf->data, pbuf->len, 0, sock, addrlen);
+    return r;
+}
+
+ssize_t TcpEndpoint::_write_raw(const uint8_t *data, size_t len)
+{
+    /* the socket is connected: send() needs no address (and works on any connected stream
+     * socket, which also lets unit tests drive this path over a socketpair) */
+    ssize_t r = ::send(fd, data, len, 0);
     if (r == -1) {
-        if (errno != EAGAIN && errno != ECONNREFUSED) {
+        int saved_errno = errno; /* the reconnect path below makes syscalls of its own */
+        if (saved_errno == EAGAIN) {
+            return -EAGAIN;
+        }
+        if (saved_errno != ECONNREFUSED) {
             log_error("TCP %s: Error sending tcp packet (%m)", _name.c_str());
         }
-        if (errno == EPIPE) {
+        if (saved_errno == EPIPE) {
             if (_retry_timeout > 0) {
+                /* clears the TX queue via close() */
                 this->_schedule_reconnect();
                 _valid = true; // still valid, b/c endpoint handles reconnect internally
             } else {
                 _valid = false; // client connection can be deleted forever
             }
         }
-        return -errno;
-    };
-
-    _stat.write.total++;
-    _stat.write.bytes += pbuf->len;
-
-    /* Incomplete packet, we warn and discard the rest */
-    if (r != (ssize_t)pbuf->len) {
-        _incomplete_msgs++;
-        log_debug("TCP %s: Discarding packet, incomplete write %zd but len=%u",
-                  _name.c_str(),
-                  r,
-                  pbuf->len);
+        return -saved_errno;
     }
-
-    log_trace("TCP [%d]%s: Wrote %zd bytes", fd, _name.c_str(), r);
 
     return r;
 }
@@ -1920,6 +1906,9 @@ Endpoint::AcceptState TcpEndpoint::accept_msg(const struct buffer *pbuf) const
 
 void TcpEndpoint::close()
 {
+    /* queued frames belong to this connection; a future connection starts clean */
+    _tx_queue_clear("connection closed");
+
     if (fd > -1) {
         Mainloop::get_instance().remove_fd(fd);
         ::close(fd);

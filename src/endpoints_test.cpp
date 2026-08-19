@@ -27,6 +27,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1041,6 +1042,123 @@ TEST(TcpEndpointTest, ConfigValidatePort)
     config.port = 0;
     EXPECT_FALSE(TcpEndpoint::validate_config(config))
         << "with port " << std::to_string(config.port);
+}
+
+class TcpTxTestEndpoint : public TcpEndpoint {
+public:
+    TcpTxTestEndpoint()
+        : TcpEndpoint{"tcp-tx-test"}
+    {
+    }
+    size_t queued_frames() const { return _tx_pending_lens.size(); }
+    uint16_t partial_len() const { return _tx_partial_len; }
+    uint32_t drops() const { return _stat.write.drops; }
+    using TcpEndpoint::close;
+};
+
+// TcpEndpoint::close() (also run by the destructor) talks to the Mainloop epoll instance
+class TcpTxTest : public ::testing::Test {
+protected:
+    void SetUp() override
+    {
+        Mainloop &mainloop = Mainloop::init();
+        // returns -EBUSY when a previous test left the epoll fd open -- that instance works fine
+        mainloop.open();
+    }
+    void TearDown() override { Mainloop::teardown(); }
+
+    static void make_blocked_pair(int sp[2])
+    {
+        ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+        int sndbuf = 1; // clamped to the kernel's floor
+        ASSERT_EQ(setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)), 0);
+        ASSERT_EQ(fcntl(sp[0], F_SETFL, O_NONBLOCK), 0);
+        ASSERT_EQ(fcntl(sp[1], F_SETFL, O_NONBLOCK), 0);
+    }
+};
+
+TEST_F(TcpTxTest, QueueOnBlockedFdPreservesStream)
+{
+    int sp[2];
+    make_blocked_pair(sp);
+
+    TcpTxTestEndpoint tcp{};
+    tcp.fd = sp[0]; // closed by the endpoint destructor
+
+    std::vector<uint8_t> storage, expected;
+    unsigned int extra = 0;
+    for (unsigned int i = 0; i < 200 && extra < 5; i++) {
+        struct buffer f = make_frame(storage, (uint8_t)i, 280);
+        int r = tcp.write_msg(&f);
+        ASSERT_TRUE(r == (int)f.len || r == -EAGAIN) << "write_msg returned " << r;
+        expected.insert(expected.end(), storage.begin(), storage.end());
+        if (r == -EAGAIN) {
+            extra++;
+        }
+    }
+    ASSERT_GE(extra, 5u) << "kernel never pushed back; cannot exercise the queue";
+
+    std::vector<uint8_t> received;
+    uint8_t buf[4096];
+    ssize_t n;
+    int flush_ret = -EAGAIN;
+    for (int guard = 0; guard < 1000 && flush_ret == -EAGAIN; guard++) {
+        while ((n = read(sp[1], buf, sizeof(buf))) > 0) {
+            received.insert(received.end(), buf, buf + n);
+        }
+        flush_ret = tcp.flush_pending_msgs();
+    }
+    EXPECT_EQ(flush_ret, 0);
+    EXPECT_EQ(tcp.queued_frames(), 0u);
+    EXPECT_EQ(tcp.partial_len(), 0);
+    while ((n = read(sp[1], buf, sizeof(buf))) > 0) {
+        received.insert(received.end(), buf, buf + n);
+    }
+
+    EXPECT_EQ(received, expected);
+    close(sp[1]);
+}
+
+TEST_F(TcpTxTest, CloseClearsQueueWithAccounting)
+{
+    int sp[2];
+    make_blocked_pair(sp);
+
+    TcpTxTestEndpoint tcp{};
+    tcp.fd = sp[0];
+
+    std::vector<uint8_t> storage;
+    unsigned int queued = 0;
+    for (unsigned int i = 0; i < 200 && queued == 0; i++) {
+        struct buffer f = make_frame(storage, (uint8_t)i, 280);
+        tcp.write_msg(&f);
+        queued = tcp.queued_frames();
+    }
+    ASSERT_GT(tcp.queued_frames(), 0u);
+
+    tcp.close();
+    EXPECT_EQ(tcp.queued_frames(), 0u);
+    EXPECT_EQ(tcp.partial_len(), 0);
+    EXPECT_GT(tcp.drops(), 0u); // cleared frames are accounted as drops
+    close(sp[1]);
+}
+
+TEST_F(TcpTxTest, EpipeInvalidatesEndpointWithoutRetry)
+{
+    signal(SIGPIPE, SIG_IGN); // the daemon ignores it in Mainloop::loop(); tests run outside it
+
+    int sp[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sp), 0);
+    close(sp[1]); // peer gone: next send gets EPIPE
+
+    TcpTxTestEndpoint tcp{};
+    tcp.fd = sp[0];
+
+    std::vector<uint8_t> s;
+    struct buffer f = make_frame(s, 0x42, 100);
+    EXPECT_EQ(tcp.write_msg(&f), -EPIPE);
+    EXPECT_FALSE(tcp.is_valid()); // RetryTimeout defaults to 0 for a bare endpoint
+    EXPECT_EQ(tcp.queued_frames(), 0u);
 }
 
 /**
