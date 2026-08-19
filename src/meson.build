@@ -45,6 +45,9 @@ if dep_gtest.found()
             version_h,
           ],
           include_directories: [src_inc, mavlink_inc],
+          # gtest may be compiled from distro sources (/usr/src/gtest) as part of this target,
+          # and its headers trip -Wfloat-equal under -Werror; tests don't need that warning
+          cpp_args: ['-Wno-float-equal'],
           dependencies : [
             dep_gtest,
             dep_rt,
@@ -72,6 +75,9 @@ if dep_gtest.found()
             version_h,
           ],
           include_directories: [src_inc, mavlink_inc],
+          # gtest may be compiled from distro sources (/usr/src/gtest) as part of this target,
+          # and its headers trip -Wfloat-equal under -Werror; tests don't need that warning
+          cpp_args: ['-Wno-float-equal'],
           dependencies : [
             dep_gtest,
             dep_rt,
