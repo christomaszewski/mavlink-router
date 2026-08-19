@@ -23,6 +23,10 @@
 #include "ulog.h"
 
 #include <limits.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -569,6 +573,51 @@ TEST(UdpEndpointTest, Init)
     EXPECT_EQ(udp.get_type(), ENDPOINT_TYPE_UDP);
 
     // TODO: create a temporary UDP socket to connect to
+}
+
+class TestUdpEndpoint : public UdpEndpoint {
+public:
+    TestUdpEndpoint()
+        : UdpEndpoint{"udp-test"}
+    {
+    }
+    using UdpEndpoint::_read_msg;
+    uint32_t incomplete_msgs() const { return _incomplete_msgs; }
+};
+
+TEST(UdpEndpointTest, TruncatedDatagramIsDropped)
+{
+    TestUdpEndpoint udp{};
+
+    // receiver socket, owned (and closed) by the endpoint, on an ephemeral loopback port
+    udp.fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(udp.fd, 0);
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(udp.fd, (struct sockaddr *)&addr, sizeof(addr)), 0);
+    socklen_t addrlen = sizeof(addr);
+    ASSERT_EQ(getsockname(udp.fd, (struct sockaddr *)&addr, &addrlen), 0);
+
+    int sender = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(sender, 0);
+
+    uint8_t big[128];
+    memset(big, 0xAB, sizeof(big));
+    ASSERT_EQ(sendto(sender, big, sizeof(big), 0, (struct sockaddr *)&addr, sizeof(addr)),
+              (ssize_t)sizeof(big));
+
+    // a datagram larger than the buffer must be dropped entirely, not truncated into the parser
+    uint8_t small[64];
+    EXPECT_EQ(udp._read_msg(small, sizeof(small)), 0);
+    EXPECT_EQ(udp.incomplete_msgs(), 1U);
+
+    // a datagram that fits is still delivered
+    ASSERT_EQ(sendto(sender, big, 32, 0, (struct sockaddr *)&addr, sizeof(addr)), 32);
+    EXPECT_EQ(udp._read_msg(small, sizeof(small)), 32);
+    EXPECT_EQ(udp.incomplete_msgs(), 1U);
+
+    close(sender);
 }
 
 TEST(UdpEndpointTest, ConfigValidateAddress)
