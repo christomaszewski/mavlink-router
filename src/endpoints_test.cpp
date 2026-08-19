@@ -22,7 +22,13 @@
 #include "tlog.h"
 #include "ulog.h"
 
+#include <endian.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <algorithm>
 
 #include <gtest/gtest.h>
 
@@ -717,6 +723,55 @@ TEST(TcpEndpointTest, ConfigValidatePort)
 /**
  * Log Endpoint
  */
+class TestTLog : public TLog {
+public:
+    TestTLog(const LogOptions &conf)
+        : TLog{conf}
+    {
+    }
+    void set_file(int file) { _file = file; }
+};
+
+TEST(LogEndpointTest, TlogWritesTimestampAndPayload)
+{
+    LogOptions conf;
+    conf.logs_dir = "./";
+    conf.log_mode = LogMode::disabled; // keep write_msg from trying to start a real log
+    conf.min_free_space = 0;
+    conf.max_log_files = 0;
+
+    char path[] = "/tmp/tlog_test_XXXXXX";
+    int file = mkstemp(path);
+    ASSERT_GE(file, 0);
+
+    TestTLog tlog{conf};
+    tlog.set_file(file);
+
+    uint8_t payload[64];
+    memset(payload, 0x6C, sizeof(payload));
+    struct buffer msg {
+    };
+    msg.data = payload;
+    msg.len = sizeof(payload);
+    msg.curr.msg_id = 1; // not a heartbeat
+
+    EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+
+    // one record: 8-byte big-endian microsecond timestamp, then the payload verbatim
+    uint8_t content[128];
+    ssize_t n = pread(file, content, sizeof(content), 0);
+    ASSERT_EQ(n, (ssize_t)(sizeof(uint64_t) + sizeof(payload)));
+    EXPECT_TRUE(std::all_of(content + 8, content + n, [](uint8_t b) { return b == 0x6C; }));
+
+    uint64_t stamp_be;
+    memcpy(&stamp_be, content, sizeof(stamp_be));
+    // sanity: decodes to a time after 2020-01-01 (in microseconds)
+    EXPECT_GT(be64toh(stamp_be), 1577836800ULL * 1000000ULL);
+
+    close(file);
+    unlink(path);
+}
+
 TEST(LogEndpointTest, Init)
 {
     LogOptions conf;

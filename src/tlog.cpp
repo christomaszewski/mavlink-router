@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -71,7 +72,17 @@ int TLog::write_msg(const struct buffer *buffer)
 
     ms_since_epoch = htobe64(ms_since_epoch);
 
-    write(_file, (void *)&ms_since_epoch, sizeof(uint64_t));
-    write(_file, buffer->data, buffer->len);
+    struct iovec iov[2];
+    iov[0].iov_base = &ms_since_epoch;
+    iov[0].iov_len = sizeof(uint64_t);
+    iov[1].iov_base = buffer->data;
+    iov[1].iov_len = buffer->len;
+
+    ssize_t r = writev(_file, iov, 2);
+    if (r < 0) {
+        log_error("TLog [%d]%s: Error writing to log file (%m)", fd, _name.c_str());
+        return buffer->len; // like the log endpoints' general policy: logging is best-effort
+    }
+
     return buffer->len;
 }
