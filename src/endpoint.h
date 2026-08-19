@@ -422,9 +422,12 @@ protected:
     static int open_ipv6(const char *ip, unsigned long port, sockaddr_in6 &sockaddr6);
 
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
+    ssize_t _write_raw(const uint8_t *data, size_t len) override;
 
     void _schedule_reconnect();
     bool _retry_timeout_cb(void *data);
+
+    int _retry_timeout = 0; // disable retry by default
 
 private:
     std::string _ip{};
@@ -432,7 +435,6 @@ private:
     bool _valid = true;
 
     bool is_ipv6;
-    int _retry_timeout = 0; // disable retry by default
     struct sockaddr_in sockaddr;
     struct sockaddr_in6 sockaddr6;
 };
