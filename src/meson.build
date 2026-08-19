@@ -45,9 +45,17 @@ if dep_gtest.found()
             version_h,
           ],
           include_directories: [src_inc, mavlink_inc],
-          # gtest may be compiled from distro sources (/usr/src/gtest) as part of this target,
-          # and its headers trip -Wfloat-equal under -Werror; tests don't need that warning
-          cpp_args: ['-Wno-float-equal'],
+          # gtest may be compiled from distro sources (/usr/src/gtest) as part of this
+          # target, so the project's strict warning set reaches gtest's own code and fails
+          # -Werror builds (observed: float-equal in gtest-printers.h, suggest-noreturn in
+          # gtest-death-test.cc, deprecation warnings). Relax the test targets only; the
+          # production binary keeps the full warning set.
+          cpp_args: [
+            '-Wno-float-equal',
+            '-Wno-suggest-attribute=noreturn',
+            '-Wno-deprecated-declarations',
+            '-Wno-missing-declarations',
+          ],
           dependencies : [
             dep_gtest,
             dep_rt,
@@ -75,9 +83,17 @@ if dep_gtest.found()
             version_h,
           ],
           include_directories: [src_inc, mavlink_inc],
-          # gtest may be compiled from distro sources (/usr/src/gtest) as part of this target,
-          # and its headers trip -Wfloat-equal under -Werror; tests don't need that warning
-          cpp_args: ['-Wno-float-equal'],
+          # gtest may be compiled from distro sources (/usr/src/gtest) as part of this
+          # target, so the project's strict warning set reaches gtest's own code and fails
+          # -Werror builds (observed: float-equal in gtest-printers.h, suggest-noreturn in
+          # gtest-death-test.cc, deprecation warnings). Relax the test targets only; the
+          # production binary keeps the full warning set.
+          cpp_args: [
+            '-Wno-float-equal',
+            '-Wno-suggest-attribute=noreturn',
+            '-Wno-deprecated-declarations',
+            '-Wno-missing-declarations',
+          ],
           dependencies : [
             dep_gtest,
             dep_rt,
