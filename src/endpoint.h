@@ -36,6 +36,8 @@
 #define ENDPOINT_TYPE_TCP  "TCP"
 #define ENDPOINT_TYPE_LOG  "Log"
 
+#define RX_BUF_MAX_SIZE (MAVLINK_MAX_PACKET_LEN * 4) ///< receive buffer of every endpoint
+
 struct UartEndpointConfig {
     std::string name;
     std::string device;

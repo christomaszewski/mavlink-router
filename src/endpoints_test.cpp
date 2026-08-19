@@ -23,6 +23,10 @@
 #include "ulog.h"
 
 #include <limits.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -569,6 +573,98 @@ TEST(UdpEndpointTest, Init)
     EXPECT_EQ(udp.get_type(), ENDPOINT_TYPE_UDP);
 
     // TODO: create a temporary UDP socket to connect to
+}
+
+class TestUdpEndpoint : public UdpEndpoint {
+public:
+    TestUdpEndpoint()
+        : UdpEndpoint{"udp-test"}
+    {
+    }
+    using UdpEndpoint::_read_msg;
+    using UdpEndpoint::open;
+    using UdpEndpoint::read_msg;
+    uint32_t incomplete_msgs() const { return _incomplete_msgs; }
+};
+
+// The endpoint is opened in server mode on an ephemeral loopback port; datagrams are delivered
+// to it through the sender socket. open() makes the receiver non-blocking, so a read finding
+// nothing pending fails the test instead of hanging it.
+class UdpReadTest : public ::testing::Test {
+protected:
+    TestUdpEndpoint udp{};
+    int sender = -1;
+    struct sockaddr_in addr = {};
+
+    void SetUp() override
+    {
+        ASSERT_TRUE(udp.open("127.0.0.1", 0, UdpEndpointConfig::Mode::Server));
+        socklen_t addrlen = sizeof(addr);
+        ASSERT_EQ(getsockname(udp.fd, (struct sockaddr *)&addr, &addrlen), 0);
+
+        sender = socket(AF_INET, SOCK_DGRAM, 0);
+        ASSERT_GE(sender, 0);
+    }
+
+    void TearDown() override
+    {
+        close(sender);
+        close(udp.fd);
+        udp.fd = -1;
+    }
+
+    void send(const uint8_t *data, size_t len)
+    {
+        EXPECT_EQ(sendto(sender, data, len, 0, (struct sockaddr *)&addr, sizeof(addr)),
+                  (ssize_t)len);
+    }
+};
+
+TEST_F(UdpReadTest, TruncatedDatagramIsDropped)
+{
+    uint8_t big[128];
+    memset(big, 0xAB, sizeof(big));
+    send(big, sizeof(big));
+
+    // a datagram larger than the buffer must be dropped entirely, not truncated into the parser
+    uint8_t small[64];
+    EXPECT_EQ(udp._read_msg(small, sizeof(small)), 0);
+    EXPECT_EQ(udp.incomplete_msgs(), 1U);
+
+    // a datagram that fits is still delivered
+    send(big, 32);
+    EXPECT_EQ(udp._read_msg(small, sizeof(small)), 32);
+    EXPECT_EQ(udp.incomplete_msgs(), 1U);
+}
+
+TEST_F(UdpReadTest, TruncatedDatagramDiscardsLeftoverPartialFrame)
+{
+    struct buffer buf = {};
+
+    // junk with a frame start byte near its end: the parser keeps the bytes from the start byte
+    // on, waiting for the rest of a header that no later datagram will ever deliver
+    const uint8_t junk[] = {0x00, 0xFD, 0x00, 0x00};
+    send(junk, sizeof(junk));
+    EXPECT_EQ(udp.read_msg(&buf), 0);
+    ASSERT_EQ(udp.rx_buf.len, 3U);
+
+    // a datagram that fits an empty buffer no longer fits next to the leftover and is dropped;
+    // the leftover has to go with it, or every later datagram of this size is dropped as well
+    uint8_t datagram[RX_BUF_MAX_SIZE - 2] = {};
+    send(datagram, sizeof(datagram));
+    EXPECT_EQ(udp.read_msg(&buf), 0);
+    EXPECT_EQ(udp.incomplete_msgs(), 1U);
+    EXPECT_EQ(udp.rx_buf.len, 0U);
+
+    // MAVLink v2 HEARTBEAT (msgid 0) from 1/1, heading a datagram of the same size
+    static const uint8_t heartbeat[]
+        = {0xFD, 0x09, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+           0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x03, 0x03, 0x83, 0x46};
+    memcpy(datagram, heartbeat, sizeof(heartbeat));
+    send(datagram, sizeof(datagram));
+    EXPECT_EQ(udp.read_msg(&buf), Endpoint::ReadOk);
+    EXPECT_EQ(buf.curr.msg_id, 0U);
+    EXPECT_EQ(udp.incomplete_msgs(), 1U);
 }
 
 TEST(UdpEndpointTest, ConfigValidateAddress)
