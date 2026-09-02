@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -195,21 +196,18 @@ void BinLog::_logging_data_process(mavlink_remote_log_data_block_t *msg)
 {
     ssize_t r;
 
-    if (lseek(_file, msg->seqno * MAVLINK_MSG_REMOTE_LOG_DATA_BLOCK_FIELD_DATA_LEN, SEEK_SET) < 0) {
-        log_error("lseek failed (%m)");
-        _restart();
-        return;
-    }
-
-    r = write(_file, msg->data, MAVLINK_MSG_REMOTE_LOG_DATA_BLOCK_FIELD_DATA_LEN);
-    if (r < 0 && errno != EAGAIN) {
-        log_error("Error writing data (%m)");
+    /* one positioned write instead of lseek + write */
+    r = _log_pwrite(msg->data,
+                    MAVLINK_MSG_REMOTE_LOG_DATA_BLOCK_FIELD_DATA_LEN,
+                    (off_t)msg->seqno * MAVLINK_MSG_REMOTE_LOG_DATA_BLOCK_FIELD_DATA_LEN);
+    if (r < 0 && r != -EAGAIN) {
+        log_error("Error writing data (%s)", strerror((int)-r));
         _restart();
         return;
     }
     if (r != MAVLINK_MSG_REMOTE_LOG_DATA_BLOCK_FIELD_DATA_LEN) {
-        // partial writes are handled by not sending ack. Flight stack should resend
-        // msg. We hope that partial writes are rare enough
+        // partial or refused writes are handled by not sending ack. Flight stack
+        // should resend msg. We hope they are rare enough
         log_error("Log partial write %zd", r);
         return;
     }
@@ -223,4 +221,12 @@ void BinLog::_restart()
     log_info("Restarting log...");
     stop();
     start();
+}
+
+void BinLog::_handle_write_error(int err)
+{
+    /* the block was acked when the writer accepted it, so it cannot be asked for again:
+     * a new log picks the stream up from its next block, as a failed write always did */
+    log_error("BinLog: writing to the log failed (%s)", strerror(err));
+    _restart();
 }

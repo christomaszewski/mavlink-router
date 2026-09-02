@@ -19,6 +19,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -90,11 +91,15 @@ void ULog::stop()
     _send_msg(&msg, _target_system_id);
 
     _buffer_len = 0;
-    /* Write the last partial message to avoid corrupt the end of the file */
-    while (_buffer_partial_len) {
-        if (!_logging_flush()) {
-            break;
-        }
+    /* Write the last partial message to avoid corrupt the end of the file. The writer takes
+     * a record whole or refuses it, so one attempt is all there is: retrying until the ring
+     * has room would spin the routing thread on the disk. */
+    _logging_flush();
+    if (_buffer_partial_len) {
+        log_warning("ULog: %u bytes of a partial message lost at stop (writer queue full)",
+                    _buffer_partial_len);
+        _dropped_records++;
+        _buffer_partial_len = 0;
     }
 
     LogEndpoint::stop();
@@ -176,6 +181,9 @@ int ULog::write_msg(const struct buffer *buffer)
     }
         /* fall through */
     case MAVLINK_MSG_ID_LOGGING_DATA: {
+        if (_file < 0) {
+            break; // not logging: nothing to append the data to
+        }
         if (trimmed_zeros) {
             mavlink_logging_data_t ulog_data;
             memcpy(&ulog_data, buffer->curr.payload, payload_len);
@@ -274,6 +282,7 @@ void ULog::_logging_data_process(mavlink_logging_data_t *msg)
      */
     if ((_buffer_len + msg->length) > BUFFER_LEN) {
         log_warning("Buffer full, dropping everything on buffer");
+        _dropped_records++;
 
         _buffer_len = 0;
         _waiting_first_msg_offset = true;
@@ -313,12 +322,12 @@ void ULog::_logging_data_process(mavlink_logging_data_t *msg)
 bool ULog::_logging_flush()
 {
     while (_buffer_partial_len) {
-        const ssize_t r = write(_file, _buffer_partial, _buffer_partial_len);
-        if (r == 0 || (r == -1 && errno == EAGAIN)) {
+        const ssize_t r = _log_write(_buffer_partial, _buffer_partial_len);
+        if (r == 0 || r == -EAGAIN) {
             return true;
         }
         if (r < 0) {
-            log_error("Unable to write to ULog file: (%m)");
+            log_error("Unable to write to ULog file: (%s)", strerror((int)-r));
             return false;
         }
 
@@ -326,44 +335,57 @@ bool ULog::_logging_flush()
         memmove(_buffer_partial, &_buffer_partial[r], _buffer_partial_len);
     }
 
-    while (_buffer_len >= sizeof(struct ulog_msg_header) && !_buffer_partial_len) {
-        auto *header = (struct ulog_msg_header *)&_buffer[_buffer_index];
-        const uint16_t full_msg_size = header->msg_size + sizeof(struct ulog_msg_header);
+    /* a complete message always fits one writer record, so a run is never split inside one */
+    static_assert(BUFFER_LEN <= LogWriter::DATA_MAX, "ULog message larger than a record");
 
-        if (full_msg_size > _buffer_len) {
-            break;
+    while (_buffer_len >= sizeof(struct ulog_msg_header) && !_buffer_partial_len) {
+        /* Hand the writer the whole run of complete messages at the front of the buffer as
+         * one record: its ring is sized in records, and one record per 20-200 byte ULog
+         * message would exhaust it in a few tens of milliseconds at typical rates. */
+        uint16_t run = 0;
+        while ((size_t)(_buffer_len - run) >= sizeof(struct ulog_msg_header)) {
+            auto *header = (struct ulog_msg_header *)&_buffer[_buffer_index + run];
+            const uint16_t full_msg_size = header->msg_size + sizeof(struct ulog_msg_header);
+
+            if (full_msg_size > _buffer_len - run
+                || (size_t)run + full_msg_size > LogWriter::DATA_MAX) {
+                break;
+            }
+            run += full_msg_size;
+        }
+        if (run == 0) {
+            break; // the message at the front is not complete yet
         }
 
-        const ssize_t r = write(_file, header, full_msg_size);
-        if (r == full_msg_size) {
-            _buffer_len -= full_msg_size;
-            _buffer_index += full_msg_size;
+        const ssize_t r = _log_write(&_buffer[_buffer_index], run);
+        if (r == run) {
+            _buffer_len -= run;
+            _buffer_index += run;
             continue;
         }
-        if (r == 0 || (r == -1 && errno == EAGAIN)) {
+        if (r == 0 || r == -EAGAIN) {
             break;
         }
         if (r < 0) {
-            log_error("Unable to write to ULog file: (%m)");
+            log_error("Unable to write to ULog file: (%s)", strerror((int)-r));
             return false;
         }
 
         /* Handle partial write */
-        _buffer_partial_len = full_msg_size - r;
+        _buffer_partial_len = run - r;
 
         if (_buffer_partial_len > sizeof(_buffer_partial)) {
             _buffer_partial_len = 0;
-            log_error("Partial buffer is not big enough to store the "
-                      "ULog entry(type=%c len=%u), ULog file is now corrupt.",
-                      header->msg_type,
-                      full_msg_size);
+            log_error("Partial buffer is not big enough to store the rest of the "
+                      "ULog entries (%u bytes), ULog file is now corrupt.",
+                      run - (unsigned)r);
             break;
         }
 
         memcpy(_buffer_partial, &_buffer[_buffer_index + r], _buffer_partial_len);
 
-        _buffer_len -= full_msg_size;
-        _buffer_index += full_msg_size;
+        _buffer_len -= run;
+        _buffer_index += run;
         break;
     }
 

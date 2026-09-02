@@ -179,7 +179,7 @@ public:
     /// then dropped: a failing link's backlog is stale).
     int flush_pending_msgs();
 
-    void log_aggregate(unsigned int interval_sec);
+    virtual void log_aggregate(unsigned int interval_sec);
 
     static uint8_t get_trimmed_zeros(const mavlink_msg_entry_t *msg_entry,
                                      const struct buffer *buffer);
