@@ -21,6 +21,8 @@ from time import sleep
 
 import argparse
 import functools
+import select
+import socket
 import subprocess
 import sys
 import time
@@ -109,6 +111,25 @@ class MavlinkReceiver(Thread):
         return self.success and func(self.received)
 
 
+def stalled_tcp_port():
+    '''Return a loopback TCP port on which a connect never completes, plus the
+    sockets that have to stay open for that to hold.
+
+    The listener's accept queue is full: listen(0) admits a single connection
+    (the helper, which is never accepted) and the kernel then drops further
+    SYNs without answering (net.ipv4.tcp_abort_on_overflow=0 by default), so
+    a client keeps retransmitting its SYN for the whole test.'''
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(('127.0.0.1', 0))
+    listener.listen(0)
+    port = listener.getsockname()[1]
+    helper = socket.create_connection(('127.0.0.1', port))
+    # the listener turns readable once the helper sits in its accept queue
+    readable, _, _ = select.select([listener], [], [], 5)
+    assert readable, "helper connection was not queued"
+    return port, (listener, helper)
+
+
 def expect_len(name, msgs, expected):
     if len(msgs) != expected:
         print(f"{name} expected {expected} messages, got {len(msgs)}")
@@ -125,13 +146,23 @@ if __name__ == "__main__":
                         help="path to mavlink-routerd")
     args = parser.parse_args()
 
-    # Setup mavlink-router
+    # Setup mavlink-router. The TCP client endpoint points at a loopback port on which
+    # the connect never completes (see stalled_tcp_port), so the router has a connect
+    # attempt pending for the whole test. The exact-count assertions below then double
+    # as a regression test that a dead TCP peer cannot stall UDP routing (connect
+    # attempts used to run blocking inside the event loop).
+    stalled_port, stalled_sockets = stalled_tcp_port()
     with subprocess.Popen([
             args.binary, "-e", "127.0.0.1:10100", "-e", "127.0.0.1:10101",
-            "127.0.0.1:10000", "-c", "/nonexistent"
+            "127.0.0.1:10000", "-c", "/nonexistent", "-p",
+            f"127.0.0.1:{stalled_port}"
     ],
                           stderr=sys.stdout.fileno(),
                           stdout=sys.stdout.fileno()) as proc:
+
+        # Give the router time to open its sockets before the first messages are sent:
+        # a sanitizer build needs a good part of a second to start up and would miss them
+        time.sleep(1)
 
         # Two senders: one send to all (target 0). The other sends to target 100/1
         sender0 = MavlinkSender("sender0", 10000, 1, 1, 0, 0)
