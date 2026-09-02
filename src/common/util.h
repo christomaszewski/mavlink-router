@@ -51,7 +51,7 @@ usec_t ts_usec(const struct timespec *ts);
 
 int mkdir_p(const char *path, int len, mode_t mode);
 
-template <typename type> bool vector_contains(std::vector<type> vect, type elem)
+template <typename type> bool vector_contains(const std::vector<type> &vect, type elem)
 {
     return std::find(vect.begin(), vect.end(), elem) != vect.end();
 }
