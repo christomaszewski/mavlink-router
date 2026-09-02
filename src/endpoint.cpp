@@ -47,7 +47,6 @@
 
 #include "mainloop.h"
 
-#define RX_BUF_MAX_SIZE (MAVLINK_MAX_PACKET_LEN * 4)
 #define TX_BUF_MAX_SIZE (8U * 1024U)
 
 #define UART_BAUD_RETRY_SEC 5
@@ -1307,7 +1306,7 @@ ssize_t UdpEndpoint::_read_msg(uint8_t *buf, size_t len)
         sock = (struct sockaddr *)&sockaddr;
     }
 
-    r = ::recvfrom(fd, buf, len, 0, sock, &addrlen);
+    r = ::recvfrom(fd, buf, len, MSG_TRUNC, sock, &addrlen);
     if (r == -1 && errno == EAGAIN) {
         return 0;
     }
@@ -1318,6 +1317,24 @@ ssize_t UdpEndpoint::_read_msg(uint8_t *buf, size_t len)
     // Update timeout
     if (nomessage_timeout) {
         Mainloop::get_instance().mod_timeout(nomessage_timeout, 5 * MSEC_PER_SEC);
+    }
+
+    /* With MSG_TRUNC the return value is the datagram's real length, which may exceed what fits
+     * in buf. A truncated datagram would feed a corrupt prefix into the parser and break the
+     * following messages in the stream, so discard it entirely. Discard whatever an earlier
+     * datagram left behind in rx_buf as well (the tail of a frame whose header was not complete):
+     * no sender splits a frame across datagrams, so the leftover can never be legitimately
+     * completed, and keeping it would shrink the space for every following datagram, dropping
+     * each one that no longer fits in turn. */
+    if (r > (ssize_t)len) {
+        _incomplete_msgs++;
+        log_debug("UDP [%d]%s: Discarding datagram truncated from %zd to %zu bytes",
+                  fd,
+                  _name.c_str(),
+                  r,
+                  len);
+        rx_buf.len = 0;
+        return 0;
     }
 
     return r;
