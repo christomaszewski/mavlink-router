@@ -24,6 +24,7 @@
 
 #include <limits.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -757,6 +758,43 @@ TEST(TcpEndpointTest, Init)
     EXPECT_FALSE(tcp.is_critical());
 
     // we can't call setup() without a TCP server to connect to
+}
+
+class NoDelayTcpEndpoint : public TcpEndpoint {
+public:
+    NoDelayTcpEndpoint()
+        : TcpEndpoint{"tcp-test"}
+    {
+    }
+    using TcpEndpoint::open;
+};
+
+TEST(TcpEndpointTest, ClientSetsTcpNoDelay)
+{
+    // listener on an ephemeral loopback port: open() connects to it right away
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listener, 0);
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(bind(listener, (struct sockaddr *)&addr, sizeof(addr)), 0);
+    socklen_t addrlen = sizeof(addr);
+    ASSERT_EQ(getsockname(listener, (struct sockaddr *)&addr, &addrlen), 0);
+    ASSERT_EQ(listen(listener, 1), 0);
+
+    NoDelayTcpEndpoint tcp{};
+    ASSERT_TRUE(tcp.open("127.0.0.1", ntohs(addr.sin_port)));
+
+    int nodelay = 0;
+    socklen_t len = sizeof(nodelay);
+    EXPECT_EQ(getsockopt(tcp.fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, &len), 0);
+    EXPECT_EQ(nodelay, 1);
+
+    // close the socket here: TcpEndpoint::close() would also unregister it from the Mainloop
+    // singleton, which this test does not set up
+    close(tcp.fd);
+    tcp.fd = -1;
+    close(listener);
 }
 
 TEST(TcpEndpointTest, ConfigValidateAddress)
