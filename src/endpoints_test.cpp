@@ -1285,6 +1285,11 @@ public:
 
 TEST(TcpEndpointTest, ClientSetsTcpNoDelay)
 {
+    // open() registers the socket with the Mainloop once the connect is asynchronous, and
+    // close() always unregisters it, so run the test against an initialised instance
+    Mainloop &mainloop = Mainloop::init();
+    mainloop.open();
+
     // listener on an ephemeral loopback port: open() connects to it right away
     int listener = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(listener, 0);
@@ -1299,16 +1304,16 @@ TEST(TcpEndpointTest, ClientSetsTcpNoDelay)
     NoDelayTcpEndpoint tcp{};
     ASSERT_TRUE(tcp.open("127.0.0.1", ntohs(addr.sin_port)));
 
+    // the option is set before connect(), so it is readable whether or not the handshake has
+    // completed by now
     int nodelay = 0;
     socklen_t len = sizeof(nodelay);
     EXPECT_EQ(getsockopt(tcp.fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, &len), 0);
     EXPECT_EQ(nodelay, 1);
 
-    // close the socket here: TcpEndpoint::close() would also unregister it from the Mainloop
-    // singleton, which this test does not set up
-    close(tcp.fd);
-    tcp.fd = -1;
+    tcp.close();
     close(listener);
+    Mainloop::teardown();
 }
 
 TEST(TcpEndpointTest, ConfigValidateAddress)
