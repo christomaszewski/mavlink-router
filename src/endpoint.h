@@ -20,6 +20,7 @@
 #include <common/conf_file.h>
 #include <common/mavlink.h>
 
+#include <deque>
 #include <memory>
 #include <string>
 #include <utility>
@@ -30,6 +31,11 @@
 #include "timeout.h"
 
 #define DEFAULT_BAUDRATE 115200U
+
+/* per-endpoint TX queue size (config "TxQueueSize"), in bytes */
+#define TX_QUEUE_SIZE_DEFAULT (8U * 1024U)
+#define TX_QUEUE_SIZE_MIN     MAVLINK_MAX_PACKET_LEN /* the ring must hold one whole frame */
+#define TX_QUEUE_SIZE_MAX     (1024U * 1024U)
 
 #define ENDPOINT_TYPE_UART "UART"
 #define ENDPOINT_TYPE_UDP  "UDP"
@@ -43,6 +49,7 @@ struct UartEndpointConfig {
     std::string device;
     std::vector<uint32_t> baudrates;
     bool flowcontrol{false};
+    unsigned long tx_queue_size{TX_QUEUE_SIZE_DEFAULT};
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint32_t> block_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -65,6 +72,7 @@ struct UdpEndpointConfig {
     std::string address;
     unsigned long port;
     Mode mode;
+    unsigned long tx_queue_size{TX_QUEUE_SIZE_DEFAULT};
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint32_t> block_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -85,6 +93,7 @@ struct TcpEndpointConfig {
     std::string address;
     unsigned long port;
     int retry_timeout{5};
+    unsigned long tx_queue_size{TX_QUEUE_SIZE_DEFAULT};
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint32_t> block_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -164,7 +173,11 @@ public:
 
     virtual void print_statistics();
     virtual int write_msg(const struct buffer *pbuf) = 0;
-    virtual int flush_pending_msgs() = 0;
+
+    /// Drain the TX queue (partial frame tail first, then whole frames, FIFO). Returns
+    /// -EAGAIN while the fd would still block, 0 once empty, or a negative errno (the queue is
+    /// then dropped: a failing link's backlog is stale).
+    int flush_pending_msgs();
 
     void log_aggregate(unsigned int interval_sec);
 
@@ -248,6 +261,32 @@ public:
 protected:
     virtual int read_msg(struct buffer *pbuf);
     virtual ssize_t _read_msg(uint8_t *buf, size_t len) = 0;
+
+    /// Transport primitive behind the TX queue: write one frame (a stream transport may write
+    /// only a prefix). Returns bytes written, -EAGAIN when the fd would block, or a negative
+    /// errno. Endpoints without a queueable transport (log files) keep the default.
+    virtual ssize_t _write_raw(const uint8_t *data, size_t len) { return -ENOSYS; }
+
+    /// _write_raw() as the queue calls it: a zero-length write is reported as -EAGAIN.
+    ssize_t _tx_write(const uint8_t *data, size_t len);
+
+    /// write_msg() body for queueing transports: flush pending frames, then send `pbuf` or
+    /// queue it. Returns the frame length, -EAGAIN iff pending TX data exists afterwards (the
+    /// mainloop arms EPOLLOUT on exactly that return value), -EMSGSIZE for a frame larger than
+    /// MAVLINK_MAX_PACKET_LEN, or the transport's error (the queue is empty afterwards).
+    int _tx_send_or_queue(const struct buffer *pbuf);
+    void _tx_queue_frame(const struct buffer *pbuf);
+    void _tx_queue_consume_front();
+    void _tx_queue_clear(const char *reason);
+    size_t _tx_pending_bytes() const { return tx_buf.len - _tx_head + _tx_partial_len; }
+
+    /// Apply the configured TX queue size (setup time only: the queue must be empty). Fails
+    /// for sizes outside [TX_QUEUE_SIZE_MIN, TX_QUEUE_SIZE_MAX] or when memory is short.
+    bool _tx_set_queue_size(size_t bytes);
+    /// validate_config() helper: range-check a TxQueueSize value, logging the offender.
+    static bool _validate_tx_queue_size(const char *type, const std::string &name,
+                                        unsigned long bytes);
+
     bool _check_crc(const mavlink_msg_entry_t *msg_entry) const;
     void _add_sys_comp_id(uint8_t sysid, uint8_t compid);
 
@@ -272,11 +311,25 @@ protected:
         struct {
             uint64_t bytes = 0;
             uint32_t total = 0;
+            uint32_t drops = 0;     // frames dropped: overflow, write error or disconnect
+            uint32_t queue_hwm = 0; // TX queue high-water mark in bytes
         } write;
     } _stat;
 
     uint32_t _incomplete_msgs = 0;
+    uint32_t _dropped_msgs = 0;
     std::vector<uint16_t> _sys_comp_ids;
+
+    // TX queue state: tx_buf holds whole, fully-unsent frames as a linear byte FIFO;
+    // [_tx_head, tx_buf.len) is the pending region, one entry in _tx_pending_lens per frame.
+    // The unsent tail of a partially-written frame lives in _tx_partial, OUTSIDE the ring, so
+    // overflow drops (which pop whole frames) can never tear a frame that is on the wire.
+    std::deque<uint16_t> _tx_pending_lens{};
+    size_t _tx_capacity = TX_QUEUE_SIZE_DEFAULT; ///< tx_buf allocation size ("TxQueueSize")
+    size_t _tx_head = 0;
+    uint8_t _tx_partial[MAVLINK_MAX_PACKET_LEN];
+    uint16_t _tx_partial_len = 0;
+    bool _tx_is_stream = true; ///< false = whole-datagram semantics (UDP)
 
 private:
     std::vector<uint32_t> _allowed_outgoing_msg_ids;
@@ -299,7 +352,6 @@ public:
     ~UartEndpoint() override = default;
 
     int write_msg(const struct buffer *pbuf) override;
-    int flush_pending_msgs() override { return -ENOSYS; }
 
     bool setup(UartEndpointConfig config); ///< open UART device and apply config
 
@@ -315,6 +367,7 @@ protected:
 
     int read_msg(struct buffer *pbuf) override;
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
+    ssize_t _write_raw(const uint8_t *data, size_t len) override;
 
 private:
     size_t _current_baud_idx = 0;
@@ -330,7 +383,6 @@ public:
     ~UdpEndpoint() override;
 
     int write_msg(const struct buffer *pbuf) override;
-    int flush_pending_msgs() override { return -ENOSYS; }
 
     bool setup(UdpEndpointConfig config); ///< open socket and apply config
 
@@ -346,6 +398,7 @@ protected:
     int open_ipv6(const char *ip, unsigned long port, UdpEndpointConfig::Mode mode);
 
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
+    ssize_t _write_raw(const uint8_t *data, size_t len) override;
 
     union {
         struct sockaddr_in v4;
@@ -367,7 +420,6 @@ public:
     ~TcpEndpoint() override;
 
     int write_msg(const struct buffer *pbuf) override;
-    int flush_pending_msgs() override { return -ENOSYS; }
     bool handle_canwrite() override;
     bool is_valid() override { return _valid; };
     bool is_critical() override { return false; };
@@ -389,9 +441,12 @@ protected:
     static int open_ipv6(const char *ip, unsigned long port, sockaddr_in6 &sockaddr6);
 
     ssize_t _read_msg(uint8_t *buf, size_t len) override;
+    ssize_t _write_raw(const uint8_t *data, size_t len) override;
 
     void _schedule_reconnect();
     bool _retry_timeout_cb(void *data);
+
+    int _retry_timeout = 0; // disable retry by default
 
     /// connect() in progress: fd is valid and armed for EPOLLOUT (fd == -1 implies false)
     bool _connecting = false;
@@ -404,7 +459,6 @@ private:
     bool _valid = true;
 
     bool is_ipv6;
-    int _retry_timeout = 0; // disable retry by default
     struct sockaddr_in sockaddr;
     struct sockaddr_in6 sockaddr6;
 };

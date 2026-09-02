@@ -195,6 +195,20 @@
 # Default: Empty (no group)
 #Group = 
 
+# Size in bytes of the transmit queue of this endpoint. When the link cannot
+# take a message right away (kernel buffer full, e.g. a slow radio fed by a
+# fast flight controller), messages wait here instead of being lost. Once the
+# queue is full, the OLDEST queued messages are dropped first, so the freshest
+# samples and protocol retries still get through. A larger queue rides out
+# longer stalls but lets the data leaving a saturated link get staler; the
+# default holds about 30 maximum-size MAVLink frames.
+# Dropped messages (queue full or link failure) and the queue's high-water
+# mark are printed with ReportStats under "Transmitted messages", and drops
+# are also aggregated into a periodic warning in the log.
+# Valid values: 280 (one maximum-size frame) to 1048576
+# Default: 8192
+#TxQueueSize = 8192
+
 ## Example
 [UartEndpoint alpha]
 Device = /dev/ttyS0
@@ -228,6 +242,7 @@ Baud = 52000
 
 # See description at UartEndpoint
 #AllowMsgIdOut = 
+#TxQueueSize = 8192
 
 ## Examples
 # bind to 0.0.0.0:10000
@@ -264,8 +279,10 @@ Port = 11000
 # Default: 5 seconds
 #RetryTimeout = 5
 
-# See description at UartEndpoint
+# See description at UartEndpoint. Connections accepted on the TcpServerPort
+# have no section of their own and always use the default queue size.
 #AllowMsgIdOut = 
+#TxQueueSize = 8192
 
 ## Example
 # connect to 127.0.0.1:25760 (e.g. another mavlink-router)

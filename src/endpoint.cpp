@@ -47,7 +47,9 @@
 
 #include "mainloop.h"
 
-#define TX_BUF_MAX_SIZE (8U * 1024U)
+static_assert(TX_QUEUE_SIZE_DEFAULT >= TX_QUEUE_SIZE_MIN
+                  && TX_QUEUE_SIZE_DEFAULT <= TX_QUEUE_SIZE_MAX,
+              "default TX queue size out of the configurable range");
 
 #define UART_BAUD_RETRY_SEC 5
 
@@ -59,6 +61,7 @@ const ConfFile::OptionsTable UartEndpoint::option_table[] = {
     {"baud",            false, ConfFile::parse_uint32_vector,   OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, baudrates)},
     {"device",          true,  ConfFile::parse_stdstring,       OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, device)},
     {"FlowControl",     false, ConfFile::parse_bool,            OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, flowcontrol)},
+    {"TxQueueSize",     false, ConfFile::parse_ul,              OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, tx_queue_size)},
     {"AllowMsgIdOut",   false, ConfFile::parse_uint32_vector,   OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, allow_msg_id_out)},
     {"BlockMsgIdOut",   false, ConfFile::parse_uint32_vector,   OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, block_msg_id_out)},
     {"AllowSrcCompOut", false, ConfFile::parse_uint8_vector,    OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, allow_src_comp_out)},
@@ -80,6 +83,7 @@ const ConfFile::OptionsTable UdpEndpoint::option_table[] = {
     {"address",         true,   ConfFile::parse_stdstring,      OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, address)},
     {"mode",            true,   UdpEndpoint::parse_udp_mode,    OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, mode)},
     {"port",            false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, port)},
+    {"TxQueueSize",     false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, tx_queue_size)},
     {"filter",          false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_msg_id_out)}, // legacy AllowMsgIdOut
     {"AllowMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_msg_id_out)},
     {"BlockMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, block_msg_id_out)},
@@ -102,6 +106,7 @@ const ConfFile::OptionsTable TcpEndpoint::option_table[] = {
     {"address",         true,   ConfFile::parse_stdstring,      OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, address)},
     {"port",            true,   ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, port)},
     {"RetryTimeout",    false,  ConfFile::parse_i,              OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, retry_timeout)},
+    {"TxQueueSize",     false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, tx_queue_size)},
     {"AllowMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, allow_msg_id_out)},
     {"BlockMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, block_msg_id_out)},
     {"AllowSrcCompOut", false,  ConfFile::parse_uint8_vector,   OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, allow_src_comp_out)},
@@ -197,7 +202,7 @@ Endpoint::Endpoint(std::string type, std::string name)
 {
     rx_buf.data = (uint8_t *)malloc(RX_BUF_MAX_SIZE);
     rx_buf.len = 0;
-    tx_buf.data = (uint8_t *)malloc(TX_BUF_MAX_SIZE);
+    tx_buf.data = (uint8_t *)malloc(_tx_capacity);
     tx_buf.len = 0;
 
     assert(rx_buf.data);
@@ -213,7 +218,233 @@ Endpoint::~Endpoint()
 bool Endpoint::handle_canwrite()
 {
     int r = flush_pending_msgs();
+    if (fd < 0) {
+        /* the flush closed the fd (e.g. a TCP write error scheduled a reconnect): there is
+         * nothing left to re-arm, and the mainloop must not mod_fd() an fd that is gone */
+        return true;
+    }
     return r == -EAGAIN;
+}
+
+ssize_t Endpoint::_tx_write(const uint8_t *data, size_t len)
+{
+    ssize_t r = _write_raw(data, len);
+    /* a zero-length write of a non-empty buffer made no progress: report it as a would-block
+     * so the partial-frame loop waits for EPOLLOUT instead of spinning on it */
+    return (r == 0 && len > 0) ? -EAGAIN : r;
+}
+
+int Endpoint::flush_pending_msgs()
+{
+    /* the unsent tail of a partially-written frame always goes first: its head is already on
+     * the wire, so the stream stays intact only if these bytes precede everything else */
+    while (_tx_partial_len > 0) {
+        ssize_t r = _tx_write(_tx_partial, _tx_partial_len);
+        if (r == -EAGAIN) {
+            return -EAGAIN;
+        }
+        if (r < 0) {
+            /* a failing link's backlog is stale by the time the link recovers: drop it whole,
+             * like the pre-queue code dropped every frame a broken write path saw. A transport
+             * that closes and clears on error (TCP reconnect) has already emptied the queue,
+             * in which case this is a no-op and nothing is counted twice. */
+            _tx_queue_clear("write error");
+            return (int)r;
+        }
+        _stat.write.bytes += r;
+        if ((uint16_t)r < _tx_partial_len) {
+            memmove(_tx_partial, _tx_partial + r, _tx_partial_len - r);
+        }
+        _tx_partial_len -= (uint16_t)r;
+    }
+
+    while (!_tx_pending_lens.empty()) {
+        uint16_t frame_len = _tx_pending_lens.front();
+        ssize_t r = _tx_write(tx_buf.data + _tx_head, frame_len);
+        if (r == -EAGAIN) {
+            return -EAGAIN;
+        }
+        if (r < 0) {
+            _tx_queue_clear("write error"); /* see above */
+            return (int)r;
+        }
+
+        _stat.write.total++;
+        _stat.write.bytes += r;
+
+        if ((size_t)r == frame_len) {
+            _tx_queue_consume_front();
+            continue;
+        }
+
+        if (_tx_is_stream) {
+            /* short write: the frame's head is on the wire; stash the unsent tail */
+            memcpy(_tx_partial, tx_buf.data + _tx_head + r, frame_len - r);
+            _tx_partial_len = (uint16_t)(frame_len - r);
+            _tx_queue_consume_front();
+            return -EAGAIN;
+        }
+
+        /* a datagram cannot be resumed; count it like a short sendto */
+        _incomplete_msgs++;
+        _tx_queue_consume_front();
+    }
+
+    return 0;
+}
+
+int Endpoint::_tx_send_or_queue(const struct buffer *pbuf)
+{
+    /* the partial slot holds exactly one MAVLink frame: a larger buffer could not be resumed
+     * after a short write, so the bound is enforced here rather than trusted from every
+     * producer */
+    if (pbuf->len > MAVLINK_MAX_PACKET_LEN) {
+        _stat.write.drops++;
+        _dropped_msgs++;
+        return -EMSGSIZE;
+    }
+
+    /* send pending data first, so frames leave in FIFO order */
+    if (_tx_partial_len > 0 || !_tx_pending_lens.empty()) {
+        int flush = flush_pending_msgs();
+        if (flush == -EAGAIN) {
+            _tx_queue_frame(pbuf);
+            return -EAGAIN;
+        }
+        if (flush < 0) {
+            /* hard error (e.g. -EPIPE): the queue has been cleared and the new frame is not
+             * sent, as before the queue existed; route_msg() needs to see the error */
+            return flush;
+        }
+    }
+
+    ssize_t r = _tx_write(pbuf->data, pbuf->len);
+    if (r == -EAGAIN) {
+        _tx_queue_frame(pbuf);
+        return -EAGAIN;
+    }
+    if (r < 0) {
+        return (int)r;
+    }
+
+    _stat.write.total++;
+    _stat.write.bytes += r;
+
+    if ((size_t)r < pbuf->len) {
+        if (_tx_is_stream) {
+            /* short write: buffer the unsent tail instead of putting a torn frame on the
+             * wire and discarding the rest */
+            memcpy(_tx_partial, pbuf->data + r, pbuf->len - r);
+            _tx_partial_len = (uint16_t)(pbuf->len - r);
+            return -EAGAIN;
+        }
+        _incomplete_msgs++;
+    }
+
+    return (int)pbuf->len;
+}
+
+void Endpoint::_tx_queue_frame(const struct buffer *pbuf)
+{
+    /* drop-oldest: periodic state (attitude, position, heartbeats) dominates MAVLink
+     * traffic, so the freshest data and protocol retries displace the stalest samples.
+     * Terminates because _tx_send_or_queue() bounds pbuf->len by MAVLINK_MAX_PACKET_LEN,
+     * which the ring always has room for (_tx_set_queue_size() enforces TX_QUEUE_SIZE_MIN). */
+    while (_tx_capacity - (tx_buf.len - _tx_head) < pbuf->len) {
+        _tx_queue_consume_front();
+        _stat.write.drops++;
+        _dropped_msgs++;
+    }
+
+    /* compact when the tail has no room but the head has */
+    if (tx_buf.len + pbuf->len > _tx_capacity) {
+        memmove(tx_buf.data, tx_buf.data + _tx_head, tx_buf.len - _tx_head);
+        tx_buf.len -= _tx_head;
+        _tx_head = 0;
+    }
+
+    memcpy(tx_buf.data + tx_buf.len, pbuf->data, pbuf->len);
+    tx_buf.len += pbuf->len;
+    _tx_pending_lens.push_back((uint16_t)pbuf->len);
+
+    size_t pending = _tx_pending_bytes();
+    if (pending > _stat.write.queue_hwm) {
+        _stat.write.queue_hwm = (uint32_t)pending;
+    }
+}
+
+void Endpoint::_tx_queue_consume_front()
+{
+    _tx_head += _tx_pending_lens.front();
+    _tx_pending_lens.pop_front();
+    if (_tx_pending_lens.empty()) {
+        _tx_head = 0;
+        tx_buf.len = 0;
+    }
+}
+
+bool Endpoint::_tx_set_queue_size(size_t bytes)
+{
+    /* resizing with frames pending would mean relocating them; setup() runs before any
+     * traffic, so an empty queue is a precondition rather than a case to handle */
+    assert(_tx_pending_lens.empty() && _tx_partial_len == 0);
+
+    if (bytes < TX_QUEUE_SIZE_MIN || bytes > TX_QUEUE_SIZE_MAX) {
+        return false;
+    }
+
+    if (bytes != _tx_capacity) {
+        auto *data = (uint8_t *)realloc(tx_buf.data, bytes);
+        if (data == nullptr) {
+            log_error("%s %s: Could not allocate a %zu byte TX queue",
+                      _type.c_str(),
+                      _name.c_str(),
+                      bytes);
+            return false;
+        }
+        tx_buf.data = data;
+        _tx_capacity = bytes;
+    }
+    tx_buf.len = 0;
+    _tx_head = 0;
+
+    return true;
+}
+
+bool Endpoint::_validate_tx_queue_size(const char *type, const std::string &name,
+                                       unsigned long bytes)
+{
+    if (bytes < TX_QUEUE_SIZE_MIN || bytes > TX_QUEUE_SIZE_MAX) {
+        log_error("%s %s: TxQueueSize %lu is out of range [%u, %u]",
+                  type,
+                  name.c_str(),
+                  bytes,
+                  (unsigned int)TX_QUEUE_SIZE_MIN,
+                  (unsigned int)TX_QUEUE_SIZE_MAX);
+        return false;
+    }
+
+    return true;
+}
+
+void Endpoint::_tx_queue_clear(const char *reason)
+{
+    size_t frames = _tx_pending_lens.size() + (_tx_partial_len > 0 ? 1 : 0);
+    if (frames == 0) {
+        return;
+    }
+    _stat.write.drops += frames;
+    _dropped_msgs += frames;
+    _tx_pending_lens.clear();
+    _tx_head = 0;
+    tx_buf.len = 0;
+    _tx_partial_len = 0;
+    log_debug("%s [%d]%s: TX queue dropped %zu frame(s): %s",
+              _type.c_str(),
+              fd,
+              _name.c_str(),
+              frames,
+              reason);
 }
 
 int Endpoint::handle_read()
@@ -684,6 +915,8 @@ void Endpoint::print_statistics()
     printf("\n\t}");
     printf("\n\tTransmitted messages {");
     printf("\n\t\tTotal: %u %" PRIu64 "KB", _stat.write.total, _stat.write.bytes / 1000);
+    printf("\n\t\tDropped (TX queue full or link failure): %u", _stat.write.drops);
+    printf("\n\t\tTX queue high-water: %uB", _stat.write.queue_hwm);
     printf("\n\t}");
     printf("\n}\n");
     fflush(stdout);
@@ -718,6 +951,16 @@ void Endpoint::log_aggregate(unsigned int interval_sec)
                     interval_sec);
         _incomplete_msgs = 0;
     }
+    if (_dropped_msgs > 0) {
+        log_warning("%s Endpoint [%d]%s: %u messages dropped (TX queue full or link failure) "
+                    "in the last %d seconds",
+                    _type.c_str(),
+                    fd,
+                    _name.c_str(),
+                    _dropped_msgs,
+                    interval_sec);
+        _dropped_msgs = 0;
+    }
 }
 
 UartEndpoint::UartEndpoint(std::string name)
@@ -729,6 +972,10 @@ UartEndpoint::UartEndpoint(std::string name)
 bool UartEndpoint::setup(UartEndpointConfig conf)
 {
     if (!this->validate_config(conf)) {
+        return false;
+    }
+
+    if (!this->_tx_set_queue_size(conf.tx_queue_size)) {
         return false;
     }
 
@@ -1001,29 +1248,26 @@ int UartEndpoint::write_msg(const struct buffer *pbuf)
         return -EINVAL;
     }
 
-    /* TODO: send any pending data */
-    if (tx_buf.len > 0) {
-        ;
+    int r = _tx_send_or_queue(pbuf);
+
+    if (r == -EAGAIN) {
+        log_trace("UART [%d]%s: Queued, %zu bytes pending", fd, _name.c_str(), _tx_pending_bytes());
+    } else if (r >= 0) {
+        log_trace("UART [%d]%s: Wrote %d bytes", fd, _name.c_str(), r);
     }
 
-    ssize_t r = ::write(fd, pbuf->data, pbuf->len);
-    if (r == -1 && errno == EAGAIN) {
-        return -EAGAIN;
+    return r;
+}
+
+ssize_t UartEndpoint::_write_raw(const uint8_t *data, size_t len)
+{
+    ssize_t r = ::write(fd, data, len);
+    if (r == -1) {
+        if (errno == EAGAIN) {
+            return -EAGAIN;
+        }
+        return -errno;
     }
-
-    _stat.write.total++;
-    _stat.write.bytes += pbuf->len;
-
-    /* Incomplete packet, we warn and discard the rest */
-    if (r != (ssize_t)pbuf->len) {
-        _incomplete_msgs++;
-        log_debug("UART %s: Discarding packet, incomplete write %zd but len=%u",
-                  _name.c_str(),
-                  r,
-                  pbuf->len);
-    }
-
-    log_trace("UART [%d]%s: Wrote %zd bytes", fd, _name.c_str(), r);
 
     return r;
 }
@@ -1058,12 +1302,17 @@ bool UartEndpoint::validate_config(const UartEndpointConfig &config)
         return false;
     }
 
+    if (!_validate_tx_queue_size("UartEndpoint", config.name, config.tx_queue_size)) {
+        return false;
+    }
+
     return true;
 }
 
 UdpEndpoint::UdpEndpoint(std::string name)
     : Endpoint{ENDPOINT_TYPE_UDP, std::move(name)}
 {
+    _tx_is_stream = false; // datagrams: queued frames are (re)sent whole, never resumed
     bzero(&sockaddr, sizeof(sockaddr));
     bzero(&sockaddr6, sizeof(sockaddr6));
 }
@@ -1078,6 +1327,10 @@ UdpEndpoint::~UdpEndpoint()
 bool UdpEndpoint::setup(UdpEndpointConfig conf)
 {
     if (!this->validate_config(conf)) {
+        return false;
+    }
+
+    if (!this->_tx_set_queue_size(conf.tx_queue_size)) {
         return false;
     }
 
@@ -1342,27 +1595,15 @@ ssize_t UdpEndpoint::_read_msg(uint8_t *buf, size_t len)
 
 int UdpEndpoint::write_msg(const struct buffer *pbuf)
 {
-    struct sockaddr *sock;
-    socklen_t addrlen;
-
     if (fd < 0) {
         log_error("UDP %s: Trying to write invalid fd", _name.c_str());
         return -EINVAL;
     }
 
-    /* TODO: send any pending data */
-    if (tx_buf.len > 0) {
-        ;
-    }
-
-    bool sock_connected = false;
+    bool sock_connected;
     if (this->is_ipv6) {
-        addrlen = sizeof(sockaddr6);
-        sock = (struct sockaddr *)&sockaddr6;
         sock_connected = sockaddr6.sin6_port != 0;
     } else {
-        addrlen = sizeof(sockaddr);
-        sock = (struct sockaddr *)&sockaddr;
         sock_connected = sockaddr.sin_port != 0;
     }
 
@@ -1371,27 +1612,39 @@ int UdpEndpoint::write_msg(const struct buffer *pbuf)
         return 0;
     }
 
-    ssize_t r = ::sendto(fd, pbuf->data, pbuf->len, 0, sock, addrlen);
+    int r = _tx_send_or_queue(pbuf);
+
+    if (r == -EAGAIN) {
+        log_trace("UDP [%d]%s: Queued, %zu bytes pending", fd, _name.c_str(), _tx_pending_bytes());
+    } else if (r >= 0) {
+        log_trace("UDP [%d]%s: Wrote %d bytes", fd, _name.c_str(), r);
+    }
+
+    return r;
+}
+
+ssize_t UdpEndpoint::_write_raw(const uint8_t *data, size_t len)
+{
+    struct sockaddr *sock;
+    socklen_t addrlen;
+
+    /* queued datagrams are sent to the CURRENT peer address: in server mode the peer may have
+     * changed between enqueue and flush, and the most recent sender is the live one */
+    if (this->is_ipv6) {
+        addrlen = sizeof(sockaddr6);
+        sock = (struct sockaddr *)&sockaddr6;
+    } else {
+        addrlen = sizeof(sockaddr);
+        sock = (struct sockaddr *)&sockaddr;
+    }
+
+    ssize_t r = ::sendto(fd, data, len, 0, sock, addrlen);
     if (r == -1) {
         if (errno != EAGAIN && errno != ECONNREFUSED && errno != ENETUNREACH) {
             log_error("UDP %s: Error sending udp packet (%m)", _name.c_str());
         }
         return -errno;
-    };
-
-    _stat.write.total++;
-    _stat.write.bytes += pbuf->len;
-
-    /* Incomplete packet, we warn and discard the rest */
-    if (r != (ssize_t)pbuf->len) {
-        _incomplete_msgs++;
-        log_debug("UDP %s: Discarding packet, incomplete write %zd but len=%u",
-                  _name.c_str(),
-                  r,
-                  pbuf->len);
     }
-
-    log_trace("UDP [%d]%s: Wrote %zd bytes", fd, _name.c_str(), r);
 
     return r;
 }
@@ -1451,6 +1704,10 @@ bool UdpEndpoint::validate_config(const UdpEndpointConfig &config)
         return false;
     }
 
+    if (!_validate_tx_queue_size("UdpEndpoint", config.name, config.tx_queue_size)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1469,6 +1726,10 @@ TcpEndpoint::~TcpEndpoint()
 bool TcpEndpoint::setup(TcpEndpointConfig conf)
 {
     if (!this->validate_config(conf)) {
+        return false;
+    }
+
+    if (!this->_tx_set_queue_size(conf.tx_queue_size)) {
         return false;
     }
 
@@ -1773,56 +2034,52 @@ ssize_t TcpEndpoint::_read_msg(uint8_t *buf, size_t len)
 
 int TcpEndpoint::write_msg(const struct buffer *pbuf)
 {
-    struct sockaddr *sock;
-    socklen_t addrlen;
-
     if (fd < 0 || _connecting) {
         // skip this endpoint if not connected (e.g. while connecting or during reconnect)
         return 0;
     }
 
-    /* TODO: send any pending data */
-    if (tx_buf.len > 0) {
-        ;
+    int r = _tx_send_or_queue(pbuf);
+
+    if (r == -EAGAIN) {
+        log_trace("TCP [%d]%s: Queued, %zu bytes pending", fd, _name.c_str(), _tx_pending_bytes());
+    } else if (r >= 0) {
+        log_trace("TCP [%d]%s: Wrote %d bytes", fd, _name.c_str(), r);
     }
 
-    if (this->is_ipv6) {
-        sock = (struct sockaddr *)&sockaddr6;
-        addrlen = sizeof(sockaddr6);
-    } else {
-        sock = (struct sockaddr *)&sockaddr;
-        addrlen = sizeof(sockaddr);
-    }
+    return r;
+}
 
-    ssize_t r = ::sendto(fd, pbuf->data, pbuf->len, 0, sock, addrlen);
+/* May reconnect: EPIPE with RetryTimeout > 0 schedules a reconnect, which closes the fd and
+ * clears the TX queue (with drop accounting) before this returns. flush_pending_msgs() relies
+ * on that: its own clear-on-error is then a no-op, so nothing is counted twice, and
+ * handle_canwrite() sees fd < 0 and does not ask the mainloop to re-arm it. */
+ssize_t TcpEndpoint::_write_raw(const uint8_t *data, size_t len)
+{
+    /* the socket is connected: send() needs no address (and works on any connected stream
+     * socket, which also lets unit tests drive this path over a socketpair). MSG_NOSIGNAL
+     * turns a dead peer into EPIPE here instead of a SIGPIPE, so the reconnect logic does not
+     * depend on the signal disposition the main loop installs. */
+    ssize_t r = ::send(fd, data, len, MSG_NOSIGNAL);
     if (r == -1) {
-        if (errno != EAGAIN && errno != ECONNREFUSED) {
+        int saved_errno = errno; /* the reconnect path below makes syscalls of its own */
+        if (saved_errno == EAGAIN) {
+            return -EAGAIN;
+        }
+        if (saved_errno != ECONNREFUSED) {
             log_error("TCP %s: Error sending tcp packet (%m)", _name.c_str());
         }
-        if (errno == EPIPE) {
+        if (saved_errno == EPIPE) {
             if (_retry_timeout > 0) {
+                /* clears the TX queue via close() */
                 this->_schedule_reconnect();
                 _valid = true; // still valid, b/c endpoint handles reconnect internally
             } else {
                 _valid = false; // client connection can be deleted forever
             }
         }
-        return -errno;
-    };
-
-    _stat.write.total++;
-    _stat.write.bytes += pbuf->len;
-
-    /* Incomplete packet, we warn and discard the rest */
-    if (r != (ssize_t)pbuf->len) {
-        _incomplete_msgs++;
-        log_debug("TCP %s: Discarding packet, incomplete write %zd but len=%u",
-                  _name.c_str(),
-                  r,
-                  pbuf->len);
+        return -saved_errno;
     }
-
-    log_trace("TCP [%d]%s: Wrote %zd bytes", fd, _name.c_str(), r);
 
     return r;
 }
@@ -1840,6 +2097,9 @@ Endpoint::AcceptState TcpEndpoint::accept_msg(const struct buffer *pbuf) const
 
 void TcpEndpoint::close()
 {
+    /* queued frames belong to this connection; a future connection starts clean */
+    _tx_queue_clear("connection closed");
+
     if (fd > -1) {
         Mainloop::get_instance().remove_fd(fd);
         ::close(fd);
@@ -1869,6 +2129,10 @@ bool TcpEndpoint::validate_config(const TcpEndpointConfig &config)
         log_error("TcpEndpoint %s: Invalid or unset TCP port %lu",
                   config.name.c_str(),
                   config.port);
+        return false;
+    }
+
+    if (!_validate_tx_queue_size("TcpEndpoint", config.name, config.tx_queue_size)) {
         return false;
     }
 
