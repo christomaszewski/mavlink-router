@@ -899,6 +899,8 @@ TEST_F(LogStartStopTest, RetentionRunsAfterStopNotAtStart)
     tlog.stop();
     // stop() reclaims: only the newest (the just-finished log) survives MaxLogFiles=1
     EXPECT_EQ(count_logs(dir), 1);
+
+    remove_dir(dir);
 }
 
 class TestTLog : public TLog {
