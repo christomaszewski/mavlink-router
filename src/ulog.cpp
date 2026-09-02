@@ -335,18 +335,32 @@ bool ULog::_logging_flush()
         memmove(_buffer_partial, &_buffer_partial[r], _buffer_partial_len);
     }
 
-    while (_buffer_len >= sizeof(struct ulog_msg_header) && !_buffer_partial_len) {
-        auto *header = (struct ulog_msg_header *)&_buffer[_buffer_index];
-        const uint16_t full_msg_size = header->msg_size + sizeof(struct ulog_msg_header);
+    /* a complete message always fits one writer record, so a run is never split inside one */
+    static_assert(BUFFER_LEN <= LogWriter::DATA_MAX, "ULog message larger than a record");
 
-        if (full_msg_size > _buffer_len) {
-            break;
+    while (_buffer_len >= sizeof(struct ulog_msg_header) && !_buffer_partial_len) {
+        /* Hand the writer the whole run of complete messages at the front of the buffer as
+         * one record: its ring is sized in records, and one record per 20-200 byte ULog
+         * message would exhaust it in a few tens of milliseconds at typical rates. */
+        uint16_t run = 0;
+        while ((size_t)(_buffer_len - run) >= sizeof(struct ulog_msg_header)) {
+            auto *header = (struct ulog_msg_header *)&_buffer[_buffer_index + run];
+            const uint16_t full_msg_size = header->msg_size + sizeof(struct ulog_msg_header);
+
+            if (full_msg_size > _buffer_len - run
+                || (size_t)run + full_msg_size > LogWriter::DATA_MAX) {
+                break;
+            }
+            run += full_msg_size;
+        }
+        if (run == 0) {
+            break; // the message at the front is not complete yet
         }
 
-        const ssize_t r = _log_write(header, full_msg_size);
-        if (r == full_msg_size) {
-            _buffer_len -= full_msg_size;
-            _buffer_index += full_msg_size;
+        const ssize_t r = _log_write(&_buffer[_buffer_index], run);
+        if (r == run) {
+            _buffer_len -= run;
+            _buffer_index += run;
             continue;
         }
         if (r == 0 || r == -EAGAIN) {
@@ -358,21 +372,20 @@ bool ULog::_logging_flush()
         }
 
         /* Handle partial write */
-        _buffer_partial_len = full_msg_size - r;
+        _buffer_partial_len = run - r;
 
         if (_buffer_partial_len > sizeof(_buffer_partial)) {
             _buffer_partial_len = 0;
-            log_error("Partial buffer is not big enough to store the "
-                      "ULog entry(type=%c len=%u), ULog file is now corrupt.",
-                      header->msg_type,
-                      full_msg_size);
+            log_error("Partial buffer is not big enough to store the rest of the "
+                      "ULog entries (%u bytes), ULog file is now corrupt.",
+                      run - (unsigned)r);
             break;
         }
 
         memcpy(_buffer_partial, &_buffer[_buffer_index + r], _buffer_partial_len);
 
-        _buffer_len -= full_msg_size;
-        _buffer_index += full_msg_size;
+        _buffer_len -= run;
+        _buffer_index += run;
         break;
     }
 

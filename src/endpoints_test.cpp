@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1192,6 +1193,106 @@ TEST_F(LogStartStopTest, BinLogRestartsOnWriteError)
     }
 
     remove_dir(dir);
+}
+
+class TestULog : public ULog {
+public:
+    TestULog(const LogOptions &conf)
+        : ULog{conf}
+    {
+    }
+    void set_file(int file) { _file = file; }
+    void use_writer(std::shared_ptr<LogWriter> writer) { _writer = writer; }
+};
+
+// append one complete ULog message (3-byte header, then payload_len bytes of fill)
+static void ulog_append_msg(std::vector<uint8_t> &stream, uint8_t type, uint16_t payload_len,
+                            uint8_t fill)
+{
+    stream.push_back(payload_len & 0xff);
+    stream.push_back(payload_len >> 8);
+    stream.push_back(type);
+    stream.insert(stream.end(), payload_len, fill);
+}
+
+// route one LOGGING_DATA message carrying stream[from, from + len) into the endpoint
+static void ulog_send(TestULog &ulog, uint16_t seq, const std::vector<uint8_t> &stream, size_t from,
+                      size_t len)
+{
+    // the endpoint reads a little past the payload while it strips the file header, as it
+    // may from its receive buffer, so give the message some room after it
+    uint8_t frame[sizeof(mavlink_logging_data_t) + 64] = {};
+    auto *data = (mavlink_logging_data_t *)frame;
+    data->sequence = seq;
+    data->length = (uint8_t)len;
+    data->first_message_offset = 0;
+    memcpy(data->data, stream.data() + from, len);
+
+    uint8_t stx = MAVLINK_STX_MAVLINK1; // a v1 frame: no trailing zeros to restore
+    struct buffer msg = {};
+    msg.data = &stx;
+    msg.len = 1;
+    msg.curr.msg_id = MAVLINK_MSG_ID_LOGGING_DATA;
+    msg.curr.payload = frame;
+    msg.curr.payload_len = MAVLINK_MSG_ID_LOGGING_DATA_LEN;
+    EXPECT_EQ(ulog.write_msg(&msg), (int)msg.len);
+}
+
+TEST(LogEndpointTest, UlogCoalescesCompleteMessages)
+{
+    // A seqpacket socket keeps the writer's records apart: every write() the worker issues
+    // arrives as exactly one packet, so the records are observable as well as their bytes.
+    int sv[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv), 0);
+
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    TestULog ulog{log_test_options()};
+    ulog.set_file(sv[1]);
+    ulog.use_writer(writer);
+
+    // the stream: the 16-byte file header, five complete messages, one message split
+    // across two LOGGING_DATA messages, and a complete one behind it
+    std::vector<uint8_t> stream
+        = {0x55, 0x4C, 0x6F, 0x67, 0x01, 0x12, 0x35, 0x01, 0, 0, 0, 0, 0, 0, 0, 0};
+    ulog_append_msg(stream, 'A', 10, 0xA0);
+    ulog_append_msg(stream, 'B', 30, 0xB0);
+    ulog_append_msg(stream, 'C', 50, 0xC0);
+    ulog_append_msg(stream, 'D', 20, 0xD0);
+    ulog_append_msg(stream, 'E', 40, 0xE0);
+    const size_t complete = stream.size();
+    ulog_append_msg(stream, 'F', 57, 0xF0);
+    const size_t split = complete + 25; // cut inside message F
+    ulog_append_msg(stream, 'G', 10, 0x60);
+    ASSERT_LE(split, 249u);
+    ASSERT_LE(stream.size() - split, 249u);
+
+    ulog_send(ulog, 0, stream, 0, split);
+    writer->drain();
+
+    // the file header goes first, then the five complete messages in ONE record; the
+    // incomplete message stays in the endpoint's buffer
+    uint8_t packet[LogWriter::DATA_MAX];
+    ASSERT_EQ(read(sv[0], packet, sizeof(packet)), 16);
+    EXPECT_EQ(memcmp(packet, stream.data(), 16), 0);
+    ASSERT_EQ(read(sv[0], packet, sizeof(packet)), (ssize_t)(complete - 16));
+    EXPECT_EQ(memcmp(packet, stream.data() + 16, complete - 16), 0);
+    ASSERT_EQ(fcntl(sv[0], F_SETFL, O_NONBLOCK), 0);
+    EXPECT_EQ(read(sv[0], packet, sizeof(packet)), -1);
+    EXPECT_EQ(errno, EAGAIN);
+
+    ulog_send(ulog, 1, stream, split, stream.size() - split);
+    writer->drain();
+
+    // once completed, the split message and the one behind it again form one record, and
+    // the records concatenate to exactly the stream
+    ASSERT_EQ(read(sv[0], packet, sizeof(packet)), (ssize_t)(stream.size() - complete));
+    EXPECT_EQ(memcmp(packet, stream.data() + complete, stream.size() - complete), 0);
+    EXPECT_EQ(read(sv[0], packet, sizeof(packet)), -1);
+    EXPECT_EQ(errno, EAGAIN);
+
+    close(sv[0]);
+    close(sv[1]);
 }
 
 /**
