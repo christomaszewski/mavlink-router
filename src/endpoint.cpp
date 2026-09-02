@@ -48,10 +48,10 @@
 #include "mainloop.h"
 
 #define RX_BUF_MAX_SIZE (MAVLINK_MAX_PACKET_LEN * 4)
-#define TX_BUF_MAX_SIZE (8U * 1024U)
 
-/* _tx_queue_frame() relies on the ring always having room for one maximum-size frame */
-static_assert(TX_BUF_MAX_SIZE >= MAVLINK_MAX_PACKET_LEN, "TX queue smaller than one frame");
+static_assert(TX_QUEUE_SIZE_DEFAULT >= TX_QUEUE_SIZE_MIN
+                  && TX_QUEUE_SIZE_DEFAULT <= TX_QUEUE_SIZE_MAX,
+              "default TX queue size out of the configurable range");
 
 #define UART_BAUD_RETRY_SEC 5
 
@@ -63,6 +63,7 @@ const ConfFile::OptionsTable UartEndpoint::option_table[] = {
     {"baud",            false, ConfFile::parse_uint32_vector,   OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, baudrates)},
     {"device",          true,  ConfFile::parse_stdstring,       OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, device)},
     {"FlowControl",     false, ConfFile::parse_bool,            OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, flowcontrol)},
+    {"TxQueueSize",     false, ConfFile::parse_ul,              OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, tx_queue_size)},
     {"AllowMsgIdOut",   false, ConfFile::parse_uint32_vector,   OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, allow_msg_id_out)},
     {"BlockMsgIdOut",   false, ConfFile::parse_uint32_vector,   OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, block_msg_id_out)},
     {"AllowSrcCompOut", false, ConfFile::parse_uint8_vector,    OPTIONS_TABLE_STRUCT_FIELD(UartEndpointConfig, allow_src_comp_out)},
@@ -84,6 +85,7 @@ const ConfFile::OptionsTable UdpEndpoint::option_table[] = {
     {"address",         true,   ConfFile::parse_stdstring,      OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, address)},
     {"mode",            true,   UdpEndpoint::parse_udp_mode,    OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, mode)},
     {"port",            false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, port)},
+    {"TxQueueSize",     false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, tx_queue_size)},
     {"filter",          false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_msg_id_out)}, // legacy AllowMsgIdOut
     {"AllowMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, allow_msg_id_out)},
     {"BlockMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(UdpEndpointConfig, block_msg_id_out)},
@@ -106,6 +108,7 @@ const ConfFile::OptionsTable TcpEndpoint::option_table[] = {
     {"address",         true,   ConfFile::parse_stdstring,      OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, address)},
     {"port",            true,   ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, port)},
     {"RetryTimeout",    false,  ConfFile::parse_i,              OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, retry_timeout)},
+    {"TxQueueSize",     false,  ConfFile::parse_ul,             OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, tx_queue_size)},
     {"AllowMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, allow_msg_id_out)},
     {"BlockMsgIdOut",   false,  ConfFile::parse_uint32_vector,  OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, block_msg_id_out)},
     {"AllowSrcCompOut", false,  ConfFile::parse_uint8_vector,   OPTIONS_TABLE_STRUCT_FIELD(TcpEndpointConfig, allow_src_comp_out)},
@@ -201,7 +204,7 @@ Endpoint::Endpoint(std::string type, std::string name)
 {
     rx_buf.data = (uint8_t *)malloc(RX_BUF_MAX_SIZE);
     rx_buf.len = 0;
-    tx_buf.data = (uint8_t *)malloc(TX_BUF_MAX_SIZE);
+    tx_buf.data = (uint8_t *)malloc(_tx_capacity);
     tx_buf.len = 0;
 
     assert(rx_buf.data);
@@ -348,15 +351,15 @@ void Endpoint::_tx_queue_frame(const struct buffer *pbuf)
     /* drop-oldest: periodic state (attitude, position, heartbeats) dominates MAVLink
      * traffic, so the freshest data and protocol retries displace the stalest samples.
      * Terminates because _tx_send_or_queue() bounds pbuf->len by MAVLINK_MAX_PACKET_LEN,
-     * which the ring always has room for (see the static_assert at TX_BUF_MAX_SIZE). */
-    while (TX_BUF_MAX_SIZE - (tx_buf.len - _tx_head) < pbuf->len) {
+     * which the ring always has room for (_tx_set_queue_size() enforces TX_QUEUE_SIZE_MIN). */
+    while (_tx_capacity - (tx_buf.len - _tx_head) < pbuf->len) {
         _tx_queue_consume_front();
         _stat.write.drops++;
         _dropped_msgs++;
     }
 
     /* compact when the tail has no room but the head has */
-    if (tx_buf.len + pbuf->len > TX_BUF_MAX_SIZE) {
+    if (tx_buf.len + pbuf->len > _tx_capacity) {
         memmove(tx_buf.data, tx_buf.data + _tx_head, tx_buf.len - _tx_head);
         tx_buf.len -= _tx_head;
         _tx_head = 0;
@@ -380,6 +383,50 @@ void Endpoint::_tx_queue_consume_front()
         _tx_head = 0;
         tx_buf.len = 0;
     }
+}
+
+bool Endpoint::_tx_set_queue_size(size_t bytes)
+{
+    /* resizing with frames pending would mean relocating them; setup() runs before any
+     * traffic, so an empty queue is a precondition rather than a case to handle */
+    assert(_tx_pending_lens.empty() && _tx_partial_len == 0);
+
+    if (bytes < TX_QUEUE_SIZE_MIN || bytes > TX_QUEUE_SIZE_MAX) {
+        return false;
+    }
+
+    if (bytes != _tx_capacity) {
+        auto *data = (uint8_t *)realloc(tx_buf.data, bytes);
+        if (data == nullptr) {
+            log_error("%s %s: Could not allocate a %zu byte TX queue",
+                      _type.c_str(),
+                      _name.c_str(),
+                      bytes);
+            return false;
+        }
+        tx_buf.data = data;
+        _tx_capacity = bytes;
+    }
+    tx_buf.len = 0;
+    _tx_head = 0;
+
+    return true;
+}
+
+bool Endpoint::_validate_tx_queue_size(const char *type, const std::string &name,
+                                       unsigned long bytes)
+{
+    if (bytes < TX_QUEUE_SIZE_MIN || bytes > TX_QUEUE_SIZE_MAX) {
+        log_error("%s %s: TxQueueSize %lu is out of range [%u, %u]",
+                  type,
+                  name.c_str(),
+                  bytes,
+                  (unsigned int)TX_QUEUE_SIZE_MIN,
+                  (unsigned int)TX_QUEUE_SIZE_MAX);
+        return false;
+    }
+
+    return true;
 }
 
 void Endpoint::_tx_queue_clear(const char *reason)
@@ -930,6 +977,10 @@ bool UartEndpoint::setup(UartEndpointConfig conf)
         return false;
     }
 
+    if (!this->_tx_set_queue_size(conf.tx_queue_size)) {
+        return false;
+    }
+
     if (!this->open(conf.device.c_str())) {
         return false;
     }
@@ -1253,6 +1304,10 @@ bool UartEndpoint::validate_config(const UartEndpointConfig &config)
         return false;
     }
 
+    if (!_validate_tx_queue_size("UartEndpoint", config.name, config.tx_queue_size)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1274,6 +1329,10 @@ UdpEndpoint::~UdpEndpoint()
 bool UdpEndpoint::setup(UdpEndpointConfig conf)
 {
     if (!this->validate_config(conf)) {
+        return false;
+    }
+
+    if (!this->_tx_set_queue_size(conf.tx_queue_size)) {
         return false;
     }
 
@@ -1629,6 +1688,10 @@ bool UdpEndpoint::validate_config(const UdpEndpointConfig &config)
         return false;
     }
 
+    if (!_validate_tx_queue_size("UdpEndpoint", config.name, config.tx_queue_size)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -1647,6 +1710,10 @@ TcpEndpoint::~TcpEndpoint()
 bool TcpEndpoint::setup(TcpEndpointConfig conf)
 {
     if (!this->validate_config(conf)) {
+        return false;
+    }
+
+    if (!this->_tx_set_queue_size(conf.tx_queue_size)) {
         return false;
     }
 
@@ -1973,6 +2040,10 @@ bool TcpEndpoint::validate_config(const TcpEndpointConfig &config)
         log_error("TcpEndpoint %s: Invalid or unset TCP port %lu",
                   config.name.c_str(),
                   config.port);
+        return false;
+    }
+
+    if (!_validate_tx_queue_size("TcpEndpoint", config.name, config.tx_queue_size)) {
         return false;
     }
 

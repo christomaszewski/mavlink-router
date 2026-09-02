@@ -32,6 +32,11 @@
 
 #define DEFAULT_BAUDRATE 115200U
 
+/* per-endpoint TX queue size (config "TxQueueSize"), in bytes */
+#define TX_QUEUE_SIZE_DEFAULT (8U * 1024U)
+#define TX_QUEUE_SIZE_MIN     MAVLINK_MAX_PACKET_LEN /* the ring must hold one whole frame */
+#define TX_QUEUE_SIZE_MAX     (1024U * 1024U)
+
 #define ENDPOINT_TYPE_UART "UART"
 #define ENDPOINT_TYPE_UDP  "UDP"
 #define ENDPOINT_TYPE_TCP  "TCP"
@@ -42,6 +47,7 @@ struct UartEndpointConfig {
     std::string device;
     std::vector<uint32_t> baudrates;
     bool flowcontrol{false};
+    unsigned long tx_queue_size{TX_QUEUE_SIZE_DEFAULT};
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint32_t> block_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -64,6 +70,7 @@ struct UdpEndpointConfig {
     std::string address;
     unsigned long port;
     Mode mode;
+    unsigned long tx_queue_size{TX_QUEUE_SIZE_DEFAULT};
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint32_t> block_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -84,6 +91,7 @@ struct TcpEndpointConfig {
     std::string address;
     unsigned long port;
     int retry_timeout{5};
+    unsigned long tx_queue_size{TX_QUEUE_SIZE_DEFAULT};
     std::vector<uint32_t> allow_msg_id_out;
     std::vector<uint32_t> block_msg_id_out;
     std::vector<uint8_t> allow_src_comp_out;
@@ -270,6 +278,13 @@ protected:
     void _tx_queue_clear(const char *reason);
     size_t _tx_pending_bytes() const { return tx_buf.len - _tx_head + _tx_partial_len; }
 
+    /// Apply the configured TX queue size (setup time only: the queue must be empty). Fails
+    /// for sizes outside [TX_QUEUE_SIZE_MIN, TX_QUEUE_SIZE_MAX] or when memory is short.
+    bool _tx_set_queue_size(size_t bytes);
+    /// validate_config() helper: range-check a TxQueueSize value, logging the offender.
+    static bool _validate_tx_queue_size(const char *type, const std::string &name,
+                                        unsigned long bytes);
+
     bool _check_crc(const mavlink_msg_entry_t *msg_entry) const;
     void _add_sys_comp_id(uint8_t sysid, uint8_t compid);
 
@@ -308,6 +323,7 @@ protected:
     // The unsent tail of a partially-written frame lives in _tx_partial, OUTSIDE the ring, so
     // overflow drops (which pop whole frames) can never tear a frame that is on the wire.
     std::deque<uint16_t> _tx_pending_lens{};
+    size_t _tx_capacity = TX_QUEUE_SIZE_DEFAULT; ///< tx_buf allocation size ("TxQueueSize")
     size_t _tx_head = 0;
     uint8_t _tx_partial[MAVLINK_MAX_PACKET_LEN];
     uint16_t _tx_partial_len = 0;

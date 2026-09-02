@@ -575,6 +575,7 @@ public:
     bool close_on_error = false;
 
     void set_datagram() { _tx_is_stream = false; }
+    bool set_queue_size(size_t bytes) { return _tx_set_queue_size(bytes); }
     size_t queued_frames() const { return _tx_pending_lens.size(); }
     size_t pending_bytes() const { return _tx_pending_bytes(); }
     uint32_t drops() const { return _stat.write.drops; }
@@ -838,6 +839,30 @@ TEST(TxQueueTest, ClearCountsDroppedFrames)
     EXPECT_EQ(ep.drops(), 3u);
 }
 
+TEST(TxQueueTest, ConfiguredSizeBoundsTheQueue)
+{
+    TxQueueTestEndpoint ep;
+    std::vector<uint8_t> storage;
+
+    EXPECT_FALSE(ep.set_queue_size(TX_QUEUE_SIZE_MIN - 1)); // must always hold a whole frame
+    EXPECT_FALSE(ep.set_queue_size(TX_QUEUE_SIZE_MAX + 1));
+    ASSERT_TRUE(ep.set_queue_size(1000));
+
+    ep.script.assign(100, -EAGAIN);
+    for (unsigned int i = 0; i < 5; i++) { // 5 * 250B fit the default 8 KiB, not 1000B
+        struct buffer f = make_frame(storage, (uint8_t)i, 250);
+        EXPECT_EQ(ep.write_msg(&f), -EAGAIN);
+    }
+    EXPECT_EQ(ep.queued_frames(), 4u);
+    EXPECT_EQ(ep.drops(), 1u);
+    EXPECT_EQ(ep.queue_hwm(), 1000u);
+
+    ep.script.clear();
+    EXPECT_EQ(ep.flush_pending_msgs(), 0);
+    ASSERT_EQ(ep.written.size(), 1000u);
+    EXPECT_EQ(ep.written[0], 1); // frame #0 was the one dropped: oldest first
+}
+
 /**
  * UART Endpoint
  */
@@ -882,6 +907,24 @@ TEST(UartEndpointTest, ConfigValidateDevice)
     // build invalid baud rate
     config.device = "";
     EXPECT_FALSE(UartEndpoint::validate_config(config)) << "with device " << config.device;
+}
+
+TEST(UartEndpointTest, ConfigValidateTxQueueSize)
+{
+    UartEndpointConfig config;
+    config.device = "/dev/ttyUSB0";
+    config.baudrates.push_back(115200);
+
+    EXPECT_TRUE(UartEndpoint::validate_config(config)) << "with the default queue size";
+    for (unsigned long size :
+         {(unsigned long)TX_QUEUE_SIZE_MIN, (unsigned long)TX_QUEUE_SIZE_MAX}) {
+        config.tx_queue_size = size;
+        EXPECT_TRUE(UartEndpoint::validate_config(config)) << "with TxQueueSize " << size;
+    }
+    for (unsigned long size : {0UL, TX_QUEUE_SIZE_MIN - 1UL, TX_QUEUE_SIZE_MAX + 1UL}) {
+        config.tx_queue_size = size;
+        EXPECT_FALSE(UartEndpoint::validate_config(config)) << "with TxQueueSize " << size;
+    }
 }
 
 class TestUartEndpoint : public UartEndpoint {
@@ -1036,6 +1079,25 @@ TEST(UdpEndpointTest, ConfigValidateMode)
     EXPECT_FALSE(UdpEndpoint::validate_config(config)) << "with Undefined mode";
 }
 
+TEST(UdpEndpointTest, ConfigValidateTxQueueSize)
+{
+    UdpEndpointConfig config;
+    config.address = "127.0.0.1";
+    config.port = 14550;
+    config.mode = UdpEndpointConfig::Mode::Client;
+
+    EXPECT_TRUE(UdpEndpoint::validate_config(config)) << "with the default queue size";
+    for (unsigned long size :
+         {(unsigned long)TX_QUEUE_SIZE_MIN, (unsigned long)TX_QUEUE_SIZE_MAX}) {
+        config.tx_queue_size = size;
+        EXPECT_TRUE(UdpEndpoint::validate_config(config)) << "with TxQueueSize " << size;
+    }
+    for (unsigned long size : {0UL, TX_QUEUE_SIZE_MIN - 1UL, TX_QUEUE_SIZE_MAX + 1UL}) {
+        config.tx_queue_size = size;
+        EXPECT_FALSE(UdpEndpoint::validate_config(config)) << "with TxQueueSize " << size;
+    }
+}
+
 class UdpTxTestEndpoint : public UdpEndpoint {
 public:
     UdpTxTestEndpoint()
@@ -1165,6 +1227,24 @@ TEST(TcpEndpointTest, ConfigValidatePort)
     config.port = 0;
     EXPECT_FALSE(TcpEndpoint::validate_config(config))
         << "with port " << std::to_string(config.port);
+}
+
+TEST(TcpEndpointTest, ConfigValidateTxQueueSize)
+{
+    TcpEndpointConfig config;
+    config.address = "127.0.0.1";
+    config.port = 14550;
+
+    EXPECT_TRUE(TcpEndpoint::validate_config(config)) << "with the default queue size";
+    for (unsigned long size :
+         {(unsigned long)TX_QUEUE_SIZE_MIN, (unsigned long)TX_QUEUE_SIZE_MAX}) {
+        config.tx_queue_size = size;
+        EXPECT_TRUE(TcpEndpoint::validate_config(config)) << "with TxQueueSize " << size;
+    }
+    for (unsigned long size : {0UL, TX_QUEUE_SIZE_MIN - 1UL, TX_QUEUE_SIZE_MAX + 1UL}) {
+        config.tx_queue_size = size;
+        EXPECT_FALSE(TcpEndpoint::validate_config(config)) << "with TxQueueSize " << size;
+    }
 }
 
 class TcpTxTestEndpoint : public TcpEndpoint {
