@@ -222,3 +222,11 @@ void BinLog::_restart()
     stop();
     start();
 }
+
+void BinLog::_handle_write_error(int err)
+{
+    /* the block was acked when the writer accepted it, so it cannot be asked for again:
+     * a new log picks the stream up from its next block, as a failed write always did */
+    log_error("BinLog: writing to the log failed (%s)", strerror(err));
+    _restart();
+}

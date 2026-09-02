@@ -105,6 +105,12 @@ uint32_t LogWriter::dropped() const
     return _dropped;
 }
 
+LogWriter::Error LogWriter::last_error() const
+{
+    std::lock_guard<std::mutex> lock(_mutex);
+    return _error;
+}
+
 bool LogWriter::_enqueue(Op op, int fd, const void *buf, size_t len, off_t offset)
 {
     if (len > DATA_MAX) {
@@ -220,6 +226,14 @@ void LogWriter::_run()
         }
 
         lock.lock();
+        if (err != 0) {
+            _error.count++;
+            _error.fd = rec.fd;
+            _error.err = err;
+        }
+        if (rec.op == Op::SyncClose && _error.fd == rec.fd) {
+            _error.fd = -1; // the fd is gone, and with it anything a poller could do about it
+        }
         _head = (_head + 1) % QUEUE_CAPACITY;
         _count--;
         if (_count == QUEUE_CAPACITY - 1) {

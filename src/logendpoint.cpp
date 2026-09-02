@@ -23,6 +23,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
@@ -407,6 +408,8 @@ bool LogEndpoint::start()
             return false; // already reported; no writer means no logging
         }
     }
+    _writer_errors_seen = _writer->last_error().count; // earlier files' failures are not ours
+    _write_error_reported = false;
 
     /* The retention scan (statvfs + full directory walk + unlink loop) runs at startup and
      * after stop() — NOT here: start() runs inline in the routing path on the arming
@@ -533,12 +536,45 @@ bool LogEndpoint::_fsync()
     }
 
     if (_writer) {
+        _poll_write_errors(); // may stop or restart the log
+        if (_file < 0) {
+            return false;
+        }
         // takes one of the reserved control slots; only when even those are in use is the
         // tick skipped, and the next 1 Hz tick retries
         _writer->fsync(_file);
     }
 
     return true;
+}
+
+void LogEndpoint::_poll_write_errors()
+{
+    /* The worker cannot call into the endpoint, so its failures are picked up here, on the
+     * routing thread. Only a failure on the open file is this endpoint's to act on: the
+     * writer forgets the fd of a failure once it has closed that fd, so an old file's
+     * failure is never taken for one on a new file that reuses the number. */
+    const LogWriter::Error err = _writer->last_error();
+    if (err.count == _writer_errors_seen) {
+        return;
+    }
+    _writer_errors_seen = err.count;
+    if (err.fd == _file) {
+        _handle_write_error(err.err);
+    }
+}
+
+void LogEndpoint::_handle_write_error(int err)
+{
+    if (!_write_error_reported) {
+        log_error("%s Endpoint [%d]%s: writing %s failed (%s), the log is incomplete",
+                  _type.c_str(),
+                  fd,
+                  _name.c_str(),
+                  _filename,
+                  strerror(err));
+        _write_error_reported = true;
+    }
 }
 
 void LogEndpoint::_remove_logging_start_timeout()

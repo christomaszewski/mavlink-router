@@ -908,7 +908,22 @@ public:
     }
     int get_file() const { return _file; }
     void set_file(int file) { _file = file; }
-    void use_writer(std::shared_ptr<LogWriter> writer) { _writer = writer; }
+    void use_writer(std::shared_ptr<LogWriter> writer)
+    {
+        _writer = writer;
+        _writer_errors_seen = writer->last_error().count; // as start() does
+    }
+    bool tick_fsync() { return _fsync(); }
+
+    int error_hook_calls = 0;
+    int error_hook_err = 0;
+
+protected:
+    void _handle_write_error(int err) override
+    {
+        error_hook_calls++;
+        error_hook_err = err;
+    }
 };
 
 static LogOptions log_test_options()
@@ -1058,6 +1073,124 @@ TEST_F(LogStartStopTest, TlogStopStartHandsOffFd)
 
     close(pfd[0]);
     close(pfd[1]);
+    remove_dir(dir);
+}
+
+TEST(LogEndpointTest, WriteErrorReachesEndpointOnce)
+{
+    // a read-only fd: every write fails on the worker with EBADF, while fsync still works
+    char path[] = "/tmp/tlog_err_XXXXXX";
+    int tmp = mkstemp(path);
+    ASSERT_GE(tmp, 0);
+    close(tmp);
+    int file = open(path, O_RDONLY);
+    ASSERT_GE(file, 0);
+
+    auto writer = LogWriter::instance();
+    ASSERT_NE(writer, nullptr);
+    TestTLog tlog{log_test_options()};
+    tlog.set_file(file);
+    tlog.use_writer(writer);
+
+    uint8_t payload[16] = {};
+    struct buffer msg = {};
+    msg.data = payload;
+    msg.len = sizeof(payload);
+    msg.curr.msg_id = 1;
+
+    // the record is accepted; the failure happens later, on the worker
+    EXPECT_EQ(tlog.write_msg(&msg), (int)msg.len);
+    writer->drain();
+    EXPECT_EQ(tlog.error_hook_calls, 0);
+
+    // the endpoint learns about it on its next 1 Hz tick, on the routing thread
+    EXPECT_TRUE(tlog.tick_fsync());
+    EXPECT_EQ(tlog.error_hook_calls, 1);
+    EXPECT_EQ(tlog.error_hook_err, EBADF);
+
+    // the same failure is not reported twice (the tick's own fsync succeeded)
+    writer->drain();
+    EXPECT_TRUE(tlog.tick_fsync());
+    EXPECT_EQ(tlog.error_hook_calls, 1);
+
+    // a failure on some other fd is not this endpoint's...
+    int other = open(path, O_RDONLY);
+    ASSERT_GE(other, 0);
+    EXPECT_TRUE(writer->write(other, payload, sizeof(payload)));
+    writer->drain();
+    EXPECT_EQ(writer->last_error().fd, other);
+    EXPECT_TRUE(tlog.tick_fsync());
+    EXPECT_EQ(tlog.error_hook_calls, 1);
+
+    // ...and once the writer has closed the failing fd, its number may be reused by an
+    // unrelated file: the error must no longer name it
+    writer->sync_close(other);
+    writer->drain();
+    EXPECT_EQ(writer->last_error().fd, -1);
+
+    close(file);
+    unlink(path);
+}
+
+class TestBinLog : public BinLog {
+public:
+    TestBinLog(const LogOptions &conf)
+        : BinLog{conf}
+    {
+    }
+    int get_file() const { return _file; }
+    void set_file(int file) { _file = file; }
+    bool tick_fsync() { return _fsync(); }
+};
+
+TEST_F(LogStartStopTest, BinLogRestartsOnWriteError)
+{
+    // A failed block write used to restart the log from _logging_data_process(); with the
+    // writer the failure is only known on the next tick, which must restart it just the same.
+    char dir_tmpl[] = "/tmp/logbinerr_XXXXXX";
+    char *dir = mkdtemp(dir_tmpl);
+    ASSERT_NE(dir, nullptr);
+
+    LogOptions conf;
+    conf.logs_dir = dir;
+    conf.log_mode = LogMode::always;
+    conf.min_free_space = 0;
+    conf.max_log_files = 0;
+
+    {
+        TestBinLog binlog{conf};
+        ASSERT_TRUE(binlog.start());
+        auto writer = LogWriter::instance();
+        ASSERT_NE(writer, nullptr);
+        const int good_fd = binlog.get_file();
+
+        // swap the log's fd for a read-only one, so the next record fails on the worker
+        int bad_fd = open(find_log(dir, 0).c_str(), O_RDONLY);
+        ASSERT_GE(bad_fd, 0);
+        struct stat bad_st;
+        ASSERT_EQ(fstat(bad_fd, &bad_st), 0);
+        binlog.set_file(bad_fd);
+        uint8_t block[8] = {};
+        EXPECT_TRUE(writer->write(bad_fd, block, sizeof(block)));
+        writer->drain();
+
+        EXPECT_TRUE(binlog.tick_fsync());
+        // restarted: a second log exists and is written through a different, open fd
+        EXPECT_EQ(count_logs(dir), 2);
+        EXPECT_GE(binlog.get_file(), 0);
+        EXPECT_NE(binlog.get_file(), bad_fd);
+        writer->drain();
+        // stop() handed the failed fd to the writer, which closed it. The number may already
+        // belong to something else (start() creates timer fds, and the worker's close can win
+        // that race), so check the descriptor no longer refers to the failed file.
+        struct stat st;
+        EXPECT_TRUE(fstat(bad_fd, &st) < 0 || st.st_ino != bad_st.st_ino);
+
+        close(good_fd); // the descriptor swapped out above
+        binlog.stop();
+        writer->drain();
+    }
+
     remove_dir(dir);
 }
 

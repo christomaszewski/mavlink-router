@@ -85,8 +85,16 @@ protected:
     uint32_t _timeout_write_total = 0;
     std::shared_ptr<LogWriter> _writer; ///< background writer, shared by all log endpoints
     uint32_t _dropped_records = 0;      ///< log data refused by a full writer ring
+    uint32_t _writer_errors_seen = 0;   ///< LogWriter::Error::count at the last poll
+    bool _write_error_reported = false; ///< the default _handle_write_error() spoke up
 
     virtual const char *_get_logfile_extension() = 0;
+
+    /// A write, fsync or close on the current log file failed on the writer thread. Called
+    /// on the routing thread from the 1 Hz _fsync() tick, so it may stop() or restart the
+    /// log. Default: report once per file and carry on -- log data is best-effort.
+    virtual void _handle_write_error(int err);
+    void _poll_write_errors();
 
     void _send_msg(const mavlink_message_t *msg, int target_sysid);
     void _remove_logging_start_timeout();

@@ -43,7 +43,8 @@
  * fd it hands over must be closed after the writes queued for it and must never leak.
  *
  * The worker never calls back into the Mainloop or any endpoint: all MAVLink emission
- * (acks, nacks, start/stop messages) stays on the routing thread.
+ * (acks, nacks, start/stop messages) stays on the routing thread. Failed syscalls are
+ * recorded in last_error() for the endpoints to poll from there.
  */
 class LogWriter {
 public:
@@ -51,6 +52,16 @@ public:
     static constexpr size_t QUEUE_CAPACITY = 128;
     /// slots only fsync/sync_close may use; data is refused once the rest of the ring is full
     static constexpr size_t CONTROL_RESERVE = 4;
+
+    /// The most recent failed operation. `count` increments on every failure, so a poller
+    /// compares it with the value it saw last; `fd` is reset to -1 when the worker closes
+    /// the fd the failure was on, so a stale error is never attributed to a new file that
+    /// reuses the number.
+    struct Error {
+        uint32_t count = 0;
+        int fd = -1;
+        int err = 0;
+    };
 
     /// One writer shared by all log endpoints: hold the returned shared_ptr for the
     /// endpoint's lifetime; the thread drains and stops when the last owner releases it.
@@ -75,6 +86,7 @@ public:
     void drain();
 
     uint32_t dropped() const;
+    Error last_error() const;
 
 private:
     LogWriter();
@@ -97,7 +109,8 @@ private:
     size_t _head = 0;      ///< next record to execute; only the worker touches the head slot
     size_t _count = 0;     ///< queued records
     uint32_t _dropped = 0; ///< records refused because the ring was full
-    int _failing_fd = -1;  ///< worker only: fd whose failure was logged, until it succeeds
+    Error _error;
+    int _failing_fd = -1; ///< worker only: fd whose failure was logged, until it succeeds
     bool _stop = false;
     mutable std::mutex _mutex;
     std::condition_variable _wake;  ///< worker wakeup: work available or stopping
